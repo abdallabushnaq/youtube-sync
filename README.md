@@ -4,21 +4,23 @@ A command-line tool that synchronises a local folder of video files with your Yo
 
 ## Features
 
-- **Upload new videos** — any video file that has no state entry is uploaded automatically.
-- **Detect changed videos** — SHA-256 checksums detect when a local file has been updated since the last upload.
-- **Version re-upload** — because YouTube does not allow replacing a video's media, changed videos are re-uploaded as a new version with a title suffix (`v2`, `v3`, …).
-- **Old version handling** — after a re-upload, the previous version is either:
-  - `keep` *(default)* — removed from the playlist but left on YouTube, preserving all user comments and the direct URL.
+- **Upload new videos** — any local video file not yet on YouTube is uploaded automatically.
+- **Version management** — video files follow a `<title>-<n>.<ext>` naming convention (e.g.
+  `My-Tutorial-1.mp4`, `My-Tutorial-2.mp4`).  When a higher-numbered version is found locally
+  than what is currently on YouTube, the new version is uploaded and the previous one becomes
+  the *old version*.  Old versions are handled according to `--old-version-strategy`:
+  - `keep` *(default)* — removed from the playlist but left on YouTube, preserving comments and the direct URL.
   - `delete` — deleted from YouTube entirely (**this also deletes all user comments**).
-- **Playlist management** — new and re-uploaded videos are added to the playlist specified in the sidecar JSON; old versions are removed from it.
-- **Quota guard** — if the YouTube API returns a `quotaExceeded` error, the tool logs clearly and stops immediately.
-- **Dry-run mode** — validates credentials and playlists, then logs what *would* happen without making any changes.
+- **Playlist management** — newly uploaded videos are added to the playlist specified in the sidecar JSON; old versions are removed from it.
+- **Quota guard** — tracks estimated API quota consumption and stops before exceeding the configured daily budget.
+- **Dry-run mode** — validates credentials and playlists, then prints what *would* happen without making any changes.
 
 ## Prerequisites
 
-1. **Java 21+** on your `PATH`.
-2. A **Google Cloud project** with the YouTube Data API v3 enabled.
-3. An **OAuth 2.0 client ID** of type *Desktop app* downloaded as `client_secret.json`.
+1. A **Google Cloud project** with the YouTube Data API v3 enabled.
+2. An **OAuth 2.0 client ID** of type *Desktop app* downloaded as `client_secret.json`.
+3. To run the **native binary**: nothing else — no JVM required.  
+   To run the **fat JAR**: **GraalVM CE JDK 25** (or any Java 25-compatible JVM) on your `PATH`.
 
 ## Setup
 
@@ -39,31 +41,41 @@ A command-line tool that synchronises a local folder of video files with your Yo
 }
 ```
 
-| Field | Required | Default | Notes |
-|---|---|---|---|
-| `title` | Yes | filename (no ext) | v2, v3 … suffix added automatically on re-upload |
-| `description` | No | `""` | |
-| `tags` | No | `[]` | |
-| `categoryId` | No | `"22"` | See [YouTube category list](https://developers.google.com/youtube/v3/docs/videoCategories/list) |
-| `privacyStatus` | No | `"private"` | `public`, `unlisted`, or `private` |
-| `playlistId` | No | none | Must be an existing playlist owned by your account |
+All fields except `title` are optional. See `copilot-instructions.md` for the full field reference.
 
 ## Building
 
 ```bash
+# Fat JAR (runs on any Java 25 JVM, no native-image toolchain needed)
 mvn package -DskipTests
+# → target/youtube-sync-1.0.0-SNAPSHOT.jar
+
+# Native binary (requires GraalVM CE JDK 25 with native-image on PATH)
+mvn -Pnative package -DskipTests
+# → target/youtube-sync          (Linux / macOS)
+# → target/youtube-sync.exe      (Windows)
 ```
 
-Produces `target/youtube-sync-1.0.0-SNAPSHOT.jar` (fat JAR, no external deps needed).
+Pre-built native binaries for Linux x86-64, macOS arm64, and Windows x86-64 are available as
+GitHub Actions artifacts on every successful CI run.
 
 ## Usage
 
 ```
-java -jar youtube-sync.jar \
-    --folder /path/to/videos \
-    [--old-version-strategy delete|keep]   # default: keep
-    [--dry-run]
+# Fat JAR
+java -jar youtube-sync.jar --folder <path> [options]
+
+# Native binary
+./youtube-sync --folder <path> [options]          # Linux / macOS
+youtube-sync.exe --folder <path> [options]        # Windows
 ```
+
+| Option | Default | Description |
+|---|---|---|
+| `--folder` | *(required)* | Folder containing video files, sidecar JSON, and `client_secret.json` |
+| `--old-version-strategy` | `keep` | `keep` — remove old version from playlist only; `delete` — delete from YouTube |
+| `--quota-budget` | `10000` | Max estimated API quota units per run (free tier = 10 000/day) |
+| `--dry-run` | `false` | Plan and display only; no uploads or deletions |
 
 ### Examples
 
@@ -74,17 +86,18 @@ java -jar youtube-sync.jar --folder /videos/tutorials
 # Sync and delete old versions entirely (comments will be lost)
 java -jar youtube-sync.jar --folder /videos/tutorials --old-version-strategy delete
 
+# Limit API quota consumption to 5 000 units
+java -jar youtube-sync.jar --folder /videos/tutorials --quota-budget 5000
+
 # See what would happen without touching YouTube
 java -jar youtube-sync.jar --folder /videos/tutorials --dry-run
 ```
 
 ## State file
 
-`youtube-sync-state.json` is written to the video folder after each upload. It records the YouTube video ID, SHA-256 checksum, upload timestamp, and version number for every processed file. **Do not delete it** — it is what prevents duplicate uploads.
-
-## Files kept out of git
-
-`client_secret.json`, `oauth-tokens/`, and `youtube-sync-state.json` are listed in `.gitignore` and should never be committed.
+`youtube-sync-state.json` is written to the video folder after each upload. It records the YouTube
+video ID, SHA-256 checksum, upload timestamp, and version number for every processed file.
+**Do not delete it** — it is what prevents duplicate uploads.
 
 ## Supported video formats
 
