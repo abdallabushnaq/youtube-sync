@@ -29,6 +29,7 @@ import me.tongfei.progressbar.ConsoleProgressBarConsumer;
 import me.tongfei.progressbar.ProgressBar;
 import me.tongfei.progressbar.ProgressBarBuilder;
 import me.tongfei.progressbar.ProgressBarStyle;
+import org.fusesource.jansi.Ansi;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -76,6 +77,20 @@ public class SyncService {
      */
     private static final Pattern TITLE_VERSION_PATTERN = Pattern.compile("^ v([0-9]+)$");
 
+    // -------------------------------------------------------------------------
+    // ANSI colour codes used in the plan table's Action column
+    // -------------------------------------------------------------------------
+
+    /**
+     * Wraps {@code text} in Jansi bright-colour codes for the plan table's Action column.
+     *
+     * @param color the bright foreground colour to apply
+     * @param text  the text to colour (must already be padded to the desired visible width)
+     * @return a string that renders in the given colour on ANSI-capable terminals
+     */
+    private static String colored(Ansi.Color color, String text) {
+        return Ansi.ansi().fgBright(color).a(text).reset().toString();
+    }
 
     private final YouTubeGateway gateway;
     private final ObjectMapper objectMapper;
@@ -108,8 +123,9 @@ public class SyncService {
      * Runs the full synchronisation pass over the given folder.
      *
      * <p>Phase 1: build a {@link SyncAction} for every video file (no mutations).<br>
-     * Phase 2: print the plan table to the console.<br>
-     * Phase 3: execute uploads (skipped when {@code dryRun = true}).
+     * Phase 2 (dry-run only): print the plan table and quota projection to the console, then
+     * exit without uploading anything.<br>
+     * Phase 3 (live only): execute uploads, printing a per-video progress bar to the console.
      *
      * @param folder the watched video folder
      * @throws IOException if the folder cannot be listed
@@ -128,13 +144,12 @@ public class SyncService {
         // --- Phase 1b: build plan ---
         List<SyncAction> plan = buildPlan(videoFiles, folder);
 
-        // --- Phase 2: print plan table ---
-        printPlanTable(plan);
-
-        // --- Phase 2b: quota projection ---
-        warnIfQuotaInsufficient(plan);
+        // --- Phase 1c: apply quota constraints (marks budget-blocked uploads as QUOTA) ---
+        plan = applyQuotaConstraints(plan);
 
         if (dryRun) {
+            // --- Phase 2 (dry-run): show plan table, then stop ---
+            printPlanTable(plan);
             log.info("[DRY-RUN] Execute phase skipped — no changes made to YouTube.");
             printSummary(plan);
             return;
@@ -226,8 +241,9 @@ public class SyncService {
      * │ File                             │ Action │ Local │ Remote │
      * ├──────────────────────────────────┼────────┼───────┼────────┤
      * │ My-Product-Intro-1.mp4           │ UPLOAD │   1   │   0    │
+     * │ My-Video-3-1.mp4                 │ QUOTA  │   1   │   0    │
      * │ My-Release-Notes-2.mp4           │  SKIP  │   2   │   2    │
-     * │ bad-filename.mp4                 │ ERROR  │   -   │   -    │
+     * │ bad-filename.mp4                 │  ERR   │   -   │   -    │
      * └──────────────────────────────────┴────────┴───────┴────────┘
      * </pre>
      *
@@ -249,18 +265,21 @@ public class SyncService {
 
         // Width available for text inside the file cell (between "│ " and " │")
         final int cellWidth = fileCol;
-        // Width available for the error message after the "↳ " prefix (4 chars: "  ↳ ")
+        // Width available for the error message after the " -> " prefix (4 ASCII chars)
         final int msgWidth  = cellWidth - 4;
 
         for (SyncAction a : plan) {
+            // Each label is exactly 6 visible characters so %s keeps the column aligned
+            // even though the Jansi escape bytes make the String longer than 6.
             String action = switch (a.kind()) {
-                case UPLOAD -> "UPLOAD";
-                case SKIP   -> " SKIP ";
-                case ERROR  -> " ERR  ";
+                case UPLOAD -> colored(Ansi.Color.GREEN,  "UPLOAD");
+                case QUOTA  -> colored(Ansi.Color.YELLOW, "QUOTA ");
+                case SKIP   -> colored(Ansi.Color.BLUE,   " SKIP ");
+                case ERROR  -> colored(Ansi.Color.RED,    " ERR  ");
             };
             String local  = a.localVersion()  >= 0 ? String.valueOf(a.localVersion())  : "-";
             String remote = a.remoteVersion() >= 0 ? String.valueOf(a.remoteVersion()) : "-";
-            System.out.printf("│ %-" + cellWidth + "s │ %-6s │  %-5s│  %-5s │%n",
+            System.out.printf("│ %-" + cellWidth + "s │ %s │  %-5s│  %-5s │%n",
                     a.filename(), action, local, remote);
             if (a.kind() == Kind.ERROR && a.errorMessage() != null) {
                 // Wrap the error message into lines of at most msgWidth characters
@@ -278,7 +297,7 @@ public class SyncService {
                         chunk     = remaining.substring(0, breakAt).stripTrailing();
                         remaining = remaining.substring(breakAt).stripLeading();
                     }
-                    String prefix = first ? "  ↳ " : "    ";
+                    String prefix = first ? " -> " : "    ";
                     first = false;
                     System.out.printf("│ %-" + cellWidth + "s │        │       │        │%n",
                             prefix + chunk);
@@ -290,44 +309,53 @@ public class SyncService {
     }
 
     /**
-     * Projects the estimated quota cost of all planned uploads against the remaining budget and
-     * logs a warning for every upload that would be blocked due to insufficient quota.
+     * Applies quota constraints to the plan by replacing budget-blocked {@link Kind#UPLOAD}
+     * actions with {@link Kind#QUOTA}.
      *
-     * <p>This is a read-only projection — no quota is actually charged here.  It lets the
-     * operator see the problem <em>before</em> any upload starts, even in dry-run mode.
+     * <p>Each {@code UPLOAD} action is consumed against a simulated copy of the remaining
+     * budget.  When the budget runs out before an upload can be served, that action is
+     * downgraded to {@code QUOTA} and a warning is written to the log.  No quota is actually
+     * charged here — this is a projection only.
      *
      * <p>Cost per upload: {@code videos.insert} (1,600) + {@code playlistItems.insert} (50)
-     * = 1,650 units.  Old-version handling is ignored here as it is conditional and cheap.
+     * = 1,650 units.  Old-version handling is ignored as it is conditional and cheap.
      *
-     * @param plan the list of planned actions
+     * @param plan the raw plan produced by {@link #buildPlan}
+     * @return a new list identical to {@code plan} except that budget-blocked uploads are
+     *         replaced by {@link Kind#QUOTA} actions
      */
-    private void warnIfQuotaInsufficient(List<SyncAction> plan) {
+    private List<SyncAction> applyQuotaConstraints(List<SyncAction> plan) {
         final int costPerUpload = QuotaTracker.COST_VIDEO_INSERT + QuotaTracker.COST_PLAYLIST_ITEM_INSERT;
-        // Simulate remaining budget as uploads are consumed one by one
         int remaining = quotaTracker.remaining();
-        boolean warned = false;
+        int deferred  = 0;
+        List<SyncAction> result = new ArrayList<>(plan.size());
         for (SyncAction action : plan) {
-            if (action.kind() != Kind.UPLOAD) continue;
-            if (remaining < costPerUpload) {
-                if (!warned) {
-                    log.warn("──────────────────────────────────────────────────────────");
-                    log.warn("QUOTA WARNING: not enough estimated quota for all uploads.");
-                    log.warn("  Remaining budget : {} units", quotaTracker.remaining());
-                    log.warn("  Cost per upload  : {} units (videos.insert + playlistItems.insert)",
-                            costPerUpload);
-                    log.warn("  The following upload(s) will be blocked at runtime:");
-                    warned = true;
+            if (action.kind() == Kind.UPLOAD) {
+                if (remaining >= costPerUpload) {
+                    remaining -= costPerUpload;
+                    result.add(action);
+                } else {
+                    log.warn("QUOTA-deferred: {} (needs {} units, only {} remaining)",
+                            action.filename(), costPerUpload, remaining);
+                    result.add(action.withKind(Kind.QUOTA));
+                    deferred++;
                 }
-                log.warn("    ✗ {} (needs {} units, only {} remaining)",
-                        action.filename(), costPerUpload, remaining);
             } else {
-                remaining -= costPerUpload;
+                result.add(action);
             }
         }
-        if (warned) {
-            log.warn("  Increase --quota-budget or wait for the daily quota to reset.");
-            log.warn("──────────────────────────────────────────────────────────");
+        if (deferred > 0) {
+            System.out.println("──────────────────────────────────────────────────────────");
+            System.out.println("QUOTA: not enough estimated quota for all uploads.");
+            System.out.printf ("  Remaining budget : %d units%n", quotaTracker.remaining());
+            System.out.printf ("  Cost per upload  : %d units (videos.insert + playlistItems.insert)%n",
+                    costPerUpload);
+            System.out.printf ("  %d upload(s) deferred to the next run (see log for details).%n", deferred);
+            System.out.println("  Increase --quota-budget or wait for the daily quota to reset.");
+            System.out.println("──────────────────────────────────────────────────────────");
+            System.out.println();
         }
+        return result;
     }
 
     // =========================================================================
@@ -348,18 +376,24 @@ public class SyncService {
                 .mapToInt(a -> a.filename().length())
                 .max()
                 .orElse(0);
+        // Match the progress bar width to the plan-table width (fileCol + 30 border chars).
+        int fileCol    = Math.max(80, plan.stream().mapToInt(a -> a.filename().length()).max().orElse(40));
+        int tableWidth = fileCol + 30;
 
         for (SyncAction action : plan) {
             if (action.kind() != Kind.UPLOAD) continue;
             uploadIndex++;
             try {
-                executeUpload(action, uploadIndex, (int) uploadCount, maxFilenameWidth);
+                executeUpload(action, uploadIndex, (int) uploadCount, maxFilenameWidth, tableWidth);
             } catch (QuotaBudgetExceededException e) {
-                log.error("Quota budget exhausted. Stopping sync. {}", e.getMessage());
-                log.error("Check real usage at https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas");
+                System.out.println();
+                System.out.println(e.getMessage());
+                log.error("Quota budget exhausted: {}", e.getMessage());
                 break;
             } catch (QuotaExceededException e) {
-                log.error("YouTube API daily quota exceeded — remaining uploads cancelled.");
+                System.out.println();
+                System.out.println("YouTube API daily quota exceeded — remaining uploads cancelled.");
+                log.error("YouTube API daily quota exceeded");
                 break;
             } catch (Exception e) {
                 log.error("Unexpected error uploading {}: {}", action.filename(), e.getMessage(), e);
@@ -377,10 +411,11 @@ public class SyncService {
      * @param index            1-based index of this upload within all uploads in the plan
      * @param totalUploads     total number of UPLOAD actions in the plan
      * @param maxFilenameWidth length of the longest filename in the plan, used for alignment
+     * @param tableWidth       total character width of the plan table, used to size the progress bar
      * @throws IOException on API failure
      */
     private void executeUpload(SyncAction action, int index, int totalUploads,
-                               int maxFilenameWidth) throws IOException {
+                               int maxFilenameWidth, int tableWidth) throws IOException {
         int indexWidth = String.valueOf(totalUploads).length();
         String prefix = String.format("[%" + indexWidth + "d/%d] %-" + maxFilenameWidth + "s",
                 index, totalUploads, action.filename());
@@ -390,7 +425,7 @@ public class SyncService {
                 ? findVideoIdInPlaylist(action.playlistId(), action.baseTitle(), action.remoteVersion())
                 : null;
 
-        String newVideoId = uploadVideo(action, prefix);
+        String newVideoId = uploadVideo(action, prefix, tableWidth);
         addToPlaylist(newVideoId, action.playlistId());
 
         if (oldVideoId != null) {
@@ -497,14 +532,18 @@ public class SyncService {
      * <p>The bar is byte-based (unit: MB) so the operator sees actual megabytes transferred.
      * Completed bars remain visible on the terminal; subsequent uploads appear below, giving a
      * stacked history of all uploads in the session.
+     * The rendered length of the bar is set to {@code tableWidth} by passing it directly to the
+     * {@link ConsoleProgressBarConsumer} constructor so the bar spans exactly as wide as the
+     * plan table printed above it.
      *
-     * @param action the planned upload action
-     * @param prefix display prefix string shown as the bar task name ({@code "[n/total] filename"})
+     * @param action     the planned upload action
+     * @param prefix     display prefix string shown as the bar task name ({@code "[n/total] filename"})
+     * @param tableWidth total character width of the plan table, passed as the bar's max rendered length
      * @return the YouTube video ID assigned by the API
      * @throws IOException            on upload failure
      * @throws QuotaExceededException if the API reports quota exhaustion
      */
-    private String uploadVideo(SyncAction action, String prefix) throws IOException {
+    private String uploadVideo(SyncAction action, String prefix, int tableWidth) throws IOException {
         quotaTracker.charge(QuotaTracker.COST_VIDEO_INSERT, "videos.insert");
         String title = buildTitle(action.baseTitle(), action.localVersion());
 
@@ -540,7 +579,7 @@ public class SyncService {
                 .setUnit("MB", 1_048_576)
                 .continuousUpdate()
                 .setStyle(ProgressBarStyle.COLORFUL_UNICODE_BLOCK)
-                .setConsumer(new ConsoleProgressBarConsumer(System.out))
+                .setConsumer(new ConsoleProgressBarConsumer(System.out, tableWidth))
                 .build()) {
             try {
                 videoId = gateway.insertVideo(snippet, status, mediaContent, (state, percent) -> {
@@ -834,14 +873,16 @@ public class SyncService {
      */
     private void printSummary(List<SyncAction> plan) {
         long uploads = plan.stream().filter(a -> a.kind() == Kind.UPLOAD).count();
+        long quotas  = plan.stream().filter(a -> a.kind() == Kind.QUOTA).count();
         long skips   = plan.stream().filter(a -> a.kind() == Kind.SKIP).count();
         long errs    = plan.stream().filter(a -> a.kind() == Kind.ERROR).count();
         log.info("─────────────────────────────────────────");
         log.info("Sync summary");
-        log.info("  Files scanned : {}", plan.size());
-        log.info("  Uploaded      : {}", dryRun ? "0 (dry-run)" : uploads);
-        log.info("  Skipped       : {}", skips);
-        log.info("  Errors        : {}", errs);
+        log.info("  Files scanned  : {}", plan.size());
+        log.info("  Uploaded       : {}", dryRun ? "0 (dry-run)" : uploads);
+        log.info("  Quota-deferred : {}", quotas);
+        log.info("  Skipped        : {}", skips);
+        log.info("  Errors         : {}", errs);
         log.info("─────────────────────────────────────────");
     }
 

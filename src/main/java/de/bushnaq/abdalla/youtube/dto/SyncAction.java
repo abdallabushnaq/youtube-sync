@@ -58,6 +58,12 @@ public record SyncAction(
         UPLOAD,
 
         /**
+         * The local version is newer than the remote version but the estimated quota budget is
+         * insufficient to perform the upload — deferred until the next run.
+         */
+        QUOTA,
+
+        /**
          * The local version is not newer than the remote version — no upload needed.
          */
         SKIP,
@@ -68,5 +74,16 @@ public record SyncAction(
          */
         ERROR
     }
-}
 
+    /**
+     * Returns a copy of this action with {@code kind} replaced by the given value.
+     * All other fields are preserved unchanged.
+     *
+     * @param newKind the replacement kind
+     * @return a new {@code SyncAction} instance
+     */
+    public SyncAction withKind(Kind newKind) {
+        return new SyncAction(videoFile, filename, baseTitle, localVersion, remoteVersion,
+                playlistId, newKind, errorMessage);
+    }
+}
