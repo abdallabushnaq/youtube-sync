@@ -1,7 +1,8 @@
 # Build a GraalVM native image and upload it as a workflow artefact.
 #
 # Triggered on every push to main and on pull requests targeting main.
-# The native binary is built on Ubuntu (Linux x86-64) using GraalVM CE for JDK 21.
+# Native binaries are built on Linux x86-64, macOS (arm64), and Windows x86-64
+# using GraalVM Community Edition for JDK 25.
 #
 # NOTE: The Jetty-based OAuth callback server used on the first auth run is
 # initialised at run time (--initialize-at-run-time flag in pom.xml native profile).
@@ -20,22 +21,46 @@ on:
 
 jobs:
   native-image:
-    name: Build native image (Linux x86-64)
-    runs-on: ubuntu-latest
+    name: Build native image (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux x86-64
+            artifact-name: youtube-sync-linux-x86_64
+            binary: target/youtube-sync
+
+          - os: macos-latest
+            label: macOS arm64
+            artifact-name: youtube-sync-macos-arm64
+            binary: target/youtube-sync
+
+          - os: windows-latest
+            label: Windows x86-64
+            artifact-name: youtube-sync-windows-x86_64
+            binary: target/youtube-sync.exe
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up GraalVM CE for JDK 21
+      - name: Set up GraalVM CE for JDK 25
         uses: graalvm/setup-graalvm@v1
         with:
-          java-version: '21'
+          java-version: '25'
           distribution: 'graalvm-community'
+          native-image-job-reports: 'true'
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build fat JAR (JVM)
-        run: mvn --batch-mode --no-transfer-progress package -DskipTests
+      - name: Cache Maven local repository
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: ${{ runner.os }}-maven-
 
       - name: Build native image
         run: mvn --batch-mode --no-transfer-progress -Pnative package -DskipTests
@@ -43,7 +68,7 @@ jobs:
       - name: Upload native binary
         uses: actions/upload-artifact@v4
         with:
-          name: youtube-sync-linux-x86_64
-          path: target/youtube-sync
+          name: ${{ matrix.artifact-name }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
           retention-days: 30
-
