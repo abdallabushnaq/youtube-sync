@@ -73,8 +73,8 @@ public class App implements Callable<Integer> {
      * so that existing comments and direct links are preserved.
      * {@code delete} removes the video from YouTube entirely (also deletes comments).
      */
-    @Option(names = "--old-version-strategy", defaultValue = "keep",
-            description = "What to do with old video versions after upload: keep (default) or delete.")
+    @Option(names = "--old-version-strategy", defaultValue = "KEEP",
+            description = "What to do with old video versions after upload: KEEP or DELETE (default: ${DEFAULT-VALUE}).")
     private OldVersionStrategy oldVersionStrategy;
 
     /**
