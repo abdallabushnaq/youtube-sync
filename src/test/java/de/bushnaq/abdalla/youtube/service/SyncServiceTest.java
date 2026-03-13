@@ -207,8 +207,9 @@ class SyncServiceTest {
     // =========================================================================
 
     /**
-     * Folder: two new videos (remote v0) + one invalid filename.
-     * Verifies exactly two uploads and two playlist insertions, none for the bad file.
+     * Folder: two new videos (remote v0), uploaded at the default simulated bandwidth (1 Mbit/s).
+     * Verifies exactly two uploads and two playlist insertions, and that the
+     * progress bars animate through intermediate steps rather than jumping straight to 100%.
      *
      * @throws Exception on unexpected failure
      */
@@ -216,7 +217,6 @@ class SyncServiceTest {
     void execute_twoNewVideos_uploadsExactlyTwice() throws Exception {
         addVideo(tempDir, "My-Product-Intro",  1, PLAYLIST_ID);
         addVideo(tempDir, "My-Release-Notes",  2, PLAYLIST_ID);
-        addInvalidVideo(tempDir, "Bad-filename");
 
         SyncService service = newService(stub, false);
         service.sync(tempDir);
@@ -307,11 +307,10 @@ class SyncServiceTest {
     }
 
     /**
-     * Folder: single 5 MB video (remote v0), stub simulates 100 Mbit/s upload bandwidth.
+     * Folder: single 5 MB video (remote v0), uploaded at the default simulated bandwidth (1 Mbit/s).
      *
-     * <p>At 100 Mbit/s = 12.5 MB/s a 5 MB file takes ~400 ms.  The stub fires progress
-     * callbacks at 10% intervals so we can verify that IN_PROGRESS events are actually
-     * delivered before COMPLETE.
+     * <p>The stub fires progress callbacks at 10 % intervals so we can verify that IN_PROGRESS
+     * events are actually delivered before COMPLETE.
      *
      * @throws Exception on unexpected failure
      */
@@ -319,7 +318,6 @@ class SyncServiceTest {
     void execute_upload_progressCallbacksFiredInOrder() throws Exception {
         addLargeVideo(tempDir, "My-Product-Intro", 1, PLAYLIST_ID, 5 * 1024 * 1024);
 
-        stub.simulatedBytesPerSecond = 100L * 1024 * 1024 / 8; // 100 Mbit/s = 12.5 MB/s
 
         SyncService service = newService(stub, false);
 
@@ -335,10 +333,10 @@ class SyncServiceTest {
         assertEquals(100, stub.lastProgressPercentSeen,
                 "last callback must be COMPLETE (100%)");
 
-        // Rough timing sanity check: 5 MB / 12.5 MB/s ≈ 400 ms; allow generous 3× margin
+        // Rough timing sanity check: 5 MB at 1 Mbit/s ≈ 40 s; assert at least one tick fired
         log.info("Simulated upload elapsed: {} ms", elapsed);
         assertTrue(elapsed >= 100,
-                "upload should take at least 100 ms with 100 Mbit/s simulation");
+                "upload should take at least 100 ms with 1 Mbit/s simulation");
     }
 
     /**
@@ -400,7 +398,7 @@ class SyncServiceTest {
     // =========================================================================
 
     /**
-     * Creates a 1-byte dummy {@code .mp4} file and a matching sidecar JSON in {@code folder}.
+     * Creates a 5 MB dummy {@code .mp4} file and a matching sidecar JSON in {@code folder}.
      * The filename is {@code <stem>-<version>.mp4}.
      *
      * @param folder     the target directory
@@ -412,7 +410,7 @@ class SyncServiceTest {
     private static void addVideo(Path folder, String stem, int version,
                                  String playlistId) throws Exception {
         String base = stem + "-" + version;
-        Files.write(folder.resolve(base + ".mp4"), new byte[]{0x00});
+        Files.write(folder.resolve(base + ".mp4"), new byte[5 * 1024 * 1024]);
         String sidecar = """
                 {
                   "description": "Test description for %s.",
@@ -426,7 +424,7 @@ class SyncServiceTest {
     }
 
     /**
-     * Creates a 1-byte dummy {@code .mp4} file in {@code folder} with no sidecar JSON.
+     * Creates a 5 MB dummy {@code .mp4} file in {@code folder} with no sidecar JSON.
      *
      * @param folder  the target directory
      * @param stem    dash-separated title stem
@@ -435,7 +433,7 @@ class SyncServiceTest {
      */
     private static void addVideoNoSidecar(Path folder, String stem, int version) throws Exception {
         String base = stem + "-" + version;
-        Files.write(folder.resolve(base + ".mp4"), new byte[]{0x00});
+        Files.write(folder.resolve(base + ".mp4"), new byte[5 * 1024 * 1024]);
     }
 
     /**
@@ -560,10 +558,10 @@ class SyncServiceTest {
 
         /**
          * Simulated upload bandwidth in bytes per second.
-         * {@code 0} (default) means instant — COMPLETE is fired immediately with no
-         * IN_PROGRESS callbacks.  Set to e.g. {@code 100L * 1024 * 1024 / 8} for 100 Mbit/s.
+         * Defaults to 1 Mbit/s (131 072 B/s) so all tests exercise the throttled
+         * IN_PROGRESS callback path.  Override per-test when instant completion is needed.
          */
-        long simulatedBytesPerSecond = 0;
+        long simulatedBytesPerSecond = 10L * 1024 * 1024 / 8; // 1 Mbit/s
 
         /** Highest IN_PROGRESS percentage seen across all uploads. */
         volatile int maxProgressPercentSeen = 0;

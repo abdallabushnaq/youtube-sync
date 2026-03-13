@@ -2,20 +2,16 @@
 <!--
   Copyright (C) 2025-2026 Abdalla Bushnaq
   Licensed under the Apache License, Version 2.0 (the "License").
+
+  Test-only Logback configuration.
+  Logs are written to target/test.log so they do not interfere with
+  the progress bars rendered on the terminal during test runs.
 -->
 <configuration>
 
-    <!--
-      All log output goes to a rolling file in the current working directory.
-      This keeps the terminal clean so progress bars are not interleaved with log lines.
-      Logs are rolled daily; the last 7 days are kept.
-    -->
-    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>youtube-sync.log</file>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <fileNamePattern>youtube-sync.%d{yyyy-MM-dd}.log</fileNamePattern>
-            <maxHistory>7</maxHistory>
-        </rollingPolicy>
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>target/test.log</file>
+        <append>false</append>
         <encoder>
             <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} — %msg%n</pattern>
         </encoder>

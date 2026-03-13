@@ -25,6 +25,10 @@ import de.bushnaq.abdalla.youtube.dto.SyncAction.Kind;
 import de.bushnaq.abdalla.youtube.dto.VideoMetadata;
 import de.bushnaq.abdalla.youtube.service.QuotaTracker.QuotaBudgetExceededException;
 import lombok.extern.slf4j.Slf4j;
+import me.tongfei.progressbar.ConsoleProgressBarConsumer;
+import me.tongfei.progressbar.ProgressBar;
+import me.tongfei.progressbar.ProgressBarBuilder;
+import me.tongfei.progressbar.ProgressBarStyle;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -72,8 +76,6 @@ public class SyncService {
      */
     private static final Pattern TITLE_VERSION_PATTERN = Pattern.compile("^ v([0-9]+)$");
 
-    /** Width of the inline upload progress bar in characters. */
-    private static final int BAR_WIDTH = 30;
 
     private final YouTubeGateway gateway;
     private final ObjectMapper objectMapper;
@@ -215,7 +217,7 @@ public class SyncService {
     // =========================================================================
 
     /**
-     * Prints a formatted plan table to {@code System.err} so the operator sees every file and
+     * Prints a formatted plan table to {@code System.out} so the operator sees every file and
      * its intended action before any upload begins.
      *
      * <p>Example:
@@ -240,10 +242,10 @@ public class SyncService {
         String mid = "├" + "─".repeat(fileCol) + "──┼────────┼───────┼────────┤";
         String bot = "└" + "─".repeat(fileCol) + "──┴────────┴───────┴────────┘";
 
-        System.err.println();
-        System.err.println(top);
-        System.err.printf("│ %-" + fileCol + "s │ Action │ Local │ Remote │%n", "File");
-        System.err.println(mid);
+        System.out.println();
+        System.out.println(top);
+        System.out.printf("│ %-" + fileCol + "s │ Action │ Local │ Remote │%n", "File");
+        System.out.println(mid);
 
         // Width available for text inside the file cell (between "│ " and " │")
         final int cellWidth = fileCol;
@@ -258,7 +260,7 @@ public class SyncService {
             };
             String local  = a.localVersion()  >= 0 ? String.valueOf(a.localVersion())  : "-";
             String remote = a.remoteVersion() >= 0 ? String.valueOf(a.remoteVersion()) : "-";
-            System.err.printf("│ %-" + cellWidth + "s │ %-6s │  %-5s│  %-5s │%n",
+            System.out.printf("│ %-" + cellWidth + "s │ %-6s │  %-5s│  %-5s │%n",
                     a.filename(), action, local, remote);
             if (a.kind() == Kind.ERROR && a.errorMessage() != null) {
                 // Wrap the error message into lines of at most msgWidth characters
@@ -278,13 +280,13 @@ public class SyncService {
                     }
                     String prefix = first ? "  ↳ " : "    ";
                     first = false;
-                    System.err.printf("│ %-" + cellWidth + "s │        │       │        │%n",
+                    System.out.printf("│ %-" + cellWidth + "s │        │       │        │%n",
                             prefix + chunk);
                 }
             }
         }
-        System.err.println(bot);
-        System.err.println();
+        System.out.println(bot);
+        System.out.println();
     }
 
     /**
@@ -341,12 +343,17 @@ public class SyncService {
     private void executePlan(List<SyncAction> plan) {
         long uploadCount = plan.stream().filter(a -> a.kind() == Kind.UPLOAD).count();
         int  uploadIndex = 0;
+        int  maxFilenameWidth = plan.stream()
+                .filter(a -> a.kind() == Kind.UPLOAD)
+                .mapToInt(a -> a.filename().length())
+                .max()
+                .orElse(0);
 
         for (SyncAction action : plan) {
             if (action.kind() != Kind.UPLOAD) continue;
             uploadIndex++;
             try {
-                executeUpload(action, uploadIndex, (int) uploadCount);
+                executeUpload(action, uploadIndex, (int) uploadCount, maxFilenameWidth);
             } catch (QuotaBudgetExceededException e) {
                 log.error("Quota budget exhausted. Stopping sync. {}", e.getMessage());
                 log.error("Check real usage at https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas");
@@ -363,13 +370,20 @@ public class SyncService {
     /**
      * Uploads a single video, adds it to the playlist, and handles the old version.
      *
-     * @param action      the planned upload action
-     * @param index       1-based index of this upload within all uploads in the plan
-     * @param totalUploads total number of UPLOAD actions in the plan
+     * <p>The {@code maxFilenameWidth} parameter is used to pad the filename in the progress-bar
+     * task name so that all bars across the session start at the same terminal column.
+     *
+     * @param action           the planned upload action
+     * @param index            1-based index of this upload within all uploads in the plan
+     * @param totalUploads     total number of UPLOAD actions in the plan
+     * @param maxFilenameWidth length of the longest filename in the plan, used for alignment
      * @throws IOException on API failure
      */
-    private void executeUpload(SyncAction action, int index, int totalUploads) throws IOException {
-        String prefix = String.format("[%d/%d] %s", index, totalUploads, action.filename());
+    private void executeUpload(SyncAction action, int index, int totalUploads,
+                               int maxFilenameWidth) throws IOException {
+        int indexWidth = String.valueOf(totalUploads).length();
+        String prefix = String.format("[%" + indexWidth + "d/%d] %-" + maxFilenameWidth + "s",
+                index, totalUploads, action.filename());
 
         // Locate old video ID before uploading (so we can handle it afterwards)
         String oldVideoId = action.remoteVersion() > 0
@@ -477,11 +491,15 @@ public class SyncService {
     }
 
     /**
-     * Uploads a video file to YouTube, rendering a per-video progress bar prefixed with
+     * Uploads a video file to YouTube, rendering a per-video {@link ProgressBar} prefixed with
      * {@code [n/total] filename}.
      *
+     * <p>The bar is byte-based (unit: MB) so the operator sees actual megabytes transferred.
+     * Completed bars remain visible on the terminal; subsequent uploads appear below, giving a
+     * stacked history of all uploads in the session.
+     *
      * @param action the planned upload action
-     * @param prefix display prefix string shown to the left of the progress bar
+     * @param prefix display prefix string shown as the bar task name ({@code "[n/total] filename"})
      * @return the YouTube video ID assigned by the API
      * @throws IOException            on upload failure
      * @throws QuotaExceededException if the API reports quota exhaustion
@@ -508,30 +526,37 @@ public class SyncService {
 
         String mimeType = guessMimeType(action.videoFile());
         FileContent mediaContent = new FileContent(mimeType, action.videoFile().toFile());
+        long fileSizeBytes = action.videoFile().toFile().length();
 
         log.info("Uploading '{}' ({}) as '{}' ...",
                 action.filename(),
-                humanReadableSize(action.videoFile().toFile().length()),
+                humanReadableSize(fileSizeBytes),
                 title);
 
-        try {
-            String videoId = gateway.insertVideo(snippet, status, mediaContent, (state, percent) -> {
-                switch (state) {
-                    case INITIATING -> log.info("Upload initialising ...");
-                    case IN_PROGRESS -> printProgress(prefix, percent);
-                    case COMPLETE -> {
-                        // Clear the progress line
-                        System.err.print("\r" + " ".repeat(prefix.length() + BAR_WIDTH + 15) + "\r");
-                        log.info("Upload transfer complete");
+        String videoId;
+        try (ProgressBar pb = new ProgressBarBuilder()
+                .setTaskName(prefix)
+                .setInitialMax(fileSizeBytes)
+                .setUnit("MB", 1_048_576)
+                .continuousUpdate()
+                .setStyle(ProgressBarStyle.COLORFUL_UNICODE_BLOCK)
+                .setConsumer(new ConsoleProgressBarConsumer(System.out))
+                .build()) {
+            try {
+                videoId = gateway.insertVideo(snippet, status, mediaContent, (state, percent) -> {
+                    switch (state) {
+                        case INITIATING -> log.info("Upload initialising ...");
+                        case IN_PROGRESS -> pb.stepTo((long) percent * fileSizeBytes / 100);
+                        case COMPLETE    -> pb.stepTo(fileSizeBytes);
                     }
-                }
-            });
-            log.info("Upload complete — videoId={}, title='{}'", videoId, title);
-            return videoId;
-        } catch (GoogleJsonResponseException e) {
-            checkQuota(e);
-            throw e;
-        }
+                });
+            } catch (GoogleJsonResponseException e) {
+                checkQuota(e);
+                throw e;
+            }
+        } // pb.close() — bar renders its completed state here
+        log.info("Upload complete — videoId={}, title='{}'", videoId, title);
+        return videoId;
     }
 
     /**
@@ -751,26 +776,6 @@ public class SyncService {
         return version == 1 ? baseTitle : baseTitle + " v" + version;
     }
 
-    /**
-     * Renders an inline upload progress bar to {@code System.err}, prefixed with
-     * {@code [n/total] filename}.
-     *
-     * <p>Example: {@code [2/3] My-Product-Intro-1.mp4 [=============>    ] 58%}
-     *
-     * @param prefix  the prefix string ({@code "[n/total] filename"})
-     * @param percent upload completion percentage 0–100
-     */
-    private void printProgress(String prefix, int percent) {
-        int filled = (int) Math.round(percent / 100.0 * BAR_WIDTH);
-        StringBuilder bar = new StringBuilder("[");
-        for (int i = 0; i < BAR_WIDTH; i++) {
-            if (i < filled - 1)      bar.append('=');
-            else if (i == filled - 1) bar.append('>');
-            else                      bar.append(' ');
-        }
-        bar.append("] ").append(percent).append('%');
-        System.err.print("\r" + prefix + " " + bar);
-    }
 
     /**
      * Guesses the MIME type of a video file by its extension.
