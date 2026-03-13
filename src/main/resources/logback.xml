@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Copyright (C) 2025-2026 Abdalla Bushnaq
+  Licensed under the Apache License, Version 2.0 (the "License").
+-->
+<configuration>
+
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} — %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- Suppress noisy Google HTTP client debug output unless explicitly needed -->
+    <logger name="com.google" level="WARN"/>
+    <logger name="org.eclipse.jetty" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+
+</configuration>
+

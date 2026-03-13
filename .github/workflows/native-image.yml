@@ -1,0 +1,49 @@
+# Build a GraalVM native image and upload it as a workflow artefact.
+#
+# Triggered on every push to main and on pull requests targeting main.
+# The native binary is built on Ubuntu (Linux x86-64) using GraalVM CE for JDK 21.
+#
+# NOTE: The Jetty-based OAuth callback server used on the first auth run is
+# initialised at run time (--initialize-at-run-time flag in pom.xml native profile).
+# If the native image fails to build due to additional initialisation issues,
+# run the agent locally with -agentlib:native-image-agent to capture a full
+# reflect-config.json and commit it under
+# src/main/resources/META-INF/native-image/de.bushnaq.abdalla/youtube-sync/.
+
+name: Native Image
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  native-image:
+    name: Build native image (Linux x86-64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up GraalVM CE for JDK 21
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '21'
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build fat JAR (JVM)
+        run: mvn --batch-mode --no-transfer-progress package -DskipTests
+
+      - name: Build native image
+        run: mvn --batch-mode --no-transfer-progress -Pnative package -DskipTests
+
+      - name: Upload native binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-sync-linux-x86_64
+          path: target/youtube-sync
+          retention-days: 30
+
