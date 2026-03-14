@@ -27,6 +27,15 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 
+import java.io.PrintStream;
+import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SymbolLookup;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandle;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.concurrent.Callable;
 
@@ -98,8 +107,68 @@ public class App implements Callable<Integer> {
      * @param args command-line arguments
      */
     public static void main(String[] args) {
+        configureWindowsConsole();
         int exitCode = new CommandLine(new App()).execute(args);
         System.exit(exitCode);
+    }
+
+    /**
+     * On Windows, switches the console output code page to UTF-8 (65001) and enables
+     * Virtual Terminal Processing so that Unicode box-drawing characters and ANSI colour
+     * escape codes render correctly in CMD and PowerShell without any manual {@code chcp}
+     * invocation by the user.
+     *
+     * <p>Uses the Java 25 Foreign Function &amp; Memory API to call {@code kernel32.dll}
+     * directly — no extra dependencies are required.  On non-Windows platforms this method
+     * is a no-op.  Any failure is silently swallowed; the application continues with whatever
+     * encoding the OS default provides.
+     */
+    private static void configureWindowsConsole() {
+        if (!System.getProperty("os.name", "").toLowerCase().contains("win")) {
+            return;
+        }
+        try {
+            Linker       linker   = Linker.nativeLinker();
+            SymbolLookup kernel32 = SymbolLookup.libraryLookup("kernel32", Arena.global());
+
+            // SetConsoleOutputCP(65001) — switch console output to UTF-8
+            MethodHandle setConsoleOutputCP = linker.downcallHandle(
+                    kernel32.find("SetConsoleOutputCP").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+            setConsoleOutputCP.invoke(65001);
+
+            // GetStdHandle(STD_OUTPUT_HANDLE = -11)
+            MethodHandle getStdHandle = linker.downcallHandle(
+                    kernel32.find("GetStdHandle").orElseThrow(),
+                    FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+            MemorySegment hOut = (MemorySegment) getStdHandle.invoke(-11);
+
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment modePtr = arena.allocate(ValueLayout.JAVA_INT);
+
+                // GetConsoleMode(hOut, &mode)
+                MethodHandle getConsoleMode = linker.downcallHandle(
+                        kernel32.find("GetConsoleMode").orElseThrow(),
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+                getConsoleMode.invoke(hOut, modePtr);
+
+                // SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+                int mode = modePtr.get(ValueLayout.JAVA_INT, 0);
+                MethodHandle setConsoleMode = linker.downcallHandle(
+                        kernel32.find("SetConsoleMode").orElseThrow(),
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+                setConsoleMode.invoke(hOut, mode | 0x0004); // 0x0004 = ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            }
+
+            // Re-wrap System.out so Java encodes characters as UTF-8 bytes
+            System.setOut(new PrintStream(System.out, true, StandardCharsets.UTF_8));
+
+        } catch (Throwable t) {
+            // Non-critical — continue with the platform default encoding
+            log.debug("Could not configure Windows console for UTF-8/ANSI: {}", t.getMessage());
+        }
     }
 
     /**

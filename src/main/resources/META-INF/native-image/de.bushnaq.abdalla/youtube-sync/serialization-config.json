@@ -1,0 +1,18 @@
+{
+  "lambdaCapturingTypes": [],
+  "types": [
+    {
+      "name": "java.util.HashMap",
+      "condition": {
+        "typeReachable": "com.google.api.client.util.store.FileDataStoreFactory"
+      }
+    },
+    {
+      "name": "com.google.api.client.auth.oauth2.StoredCredential",
+      "condition": {
+        "typeReachable": "com.google.api.client.util.store.FileDataStoreFactory"
+      }
+    }
+  ]
+}
+

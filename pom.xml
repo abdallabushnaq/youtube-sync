@@ -11,8 +11,8 @@
   See the License for the specific language governing permissions and
   limitations under the License.
 -->
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+<project xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xmlns="http://maven.apache.org/POM/4.0.0"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
@@ -40,7 +40,6 @@
         <junit.version>5.10.3</junit.version>
         <picocli.version>4.7.6</picocli.version>
         <jansi.version>2.4.1</jansi.version>
-        <native.maven.plugin.version>0.10.3</native.maven.plugin.version>
     </properties>
 
     <dependencies>
@@ -161,14 +160,19 @@
                 <executions>
                     <execution>
                         <phase>package</phase>
-                        <goals><goal>shade</goal></goals>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
                         <configuration>
                             <createDependencyReducedPom>false</createDependencyReducedPom>
+                            <outputFile>${project.build.directory}/youtube-sync.jar</outputFile>
                             <transformers>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                <transformer
+                                        implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>de.bushnaq.abdalla.youtube.App</mainClass>
                                 </transformer>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <transformer
+                                        implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
                             <filters>
                                 <filter>
@@ -189,51 +193,16 @@
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>3.2.5</version>
+                <configuration>
+                    <!-- Force UTF-8 for System.out in the forked JVM so that Unicode
+                         box-drawing characters in the plan-table output render correctly
+                         on Windows, where the console code page is otherwise non-UTF-8.
+                         stdout.encoding is available since Java 17. -->
+                    <argLine>-Dstdout.encoding=UTF-8</argLine>
+                </configuration>
             </plugin>
         </plugins>
     </build>
 
-    <profiles>
-        <!-- ================================================================
-             native — build a GraalVM native image.
-             Activate with:  mvn -Pnative package
-             Requires GraalVM JDK 25 on PATH with native-image component.
-             ================================================================ -->
-        <profile>
-            <id>native</id>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.graalvm.buildtools</groupId>
-                        <artifactId>native-maven-plugin</artifactId>
-                        <version>${native.maven.plugin.version}</version>
-                        <extensions>true</extensions>
-                        <executions>
-                            <execution>
-                                <id>build-native</id>
-                                <goals>
-                                    <goal>compile-no-fork</goal>
-                                </goals>
-                                <phase>package</phase>
-                            </execution>
-                        </executions>
-                        <configuration>
-                            <imageName>youtube-sync</imageName>
-                            <mainClass>de.bushnaq.abdalla.youtube.App</mainClass>
-                            <buildArgs>
-                                <!-- Jetty (used by the OAuth callback server) loads classes
-                                     dynamically, so it must be initialised at run time.       -->
-                                <buildArg>--initialize-at-run-time=org.eclipse.jetty</buildArg>
-                                <buildArg>--initialize-at-run-time=com.google.api.client.extensions.jetty</buildArg>
-                                <!-- Reduce image size; report errors at build time -->
-                                <buildArg>--no-fallback</buildArg>
-                                <buildArg>-H:+ReportExceptionStackTraces</buildArg>
-                            </buildArgs>
-                        </configuration>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-    </profiles>
 
 </project>

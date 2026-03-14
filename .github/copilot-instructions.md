@@ -12,7 +12,7 @@ Abdalla Bushnaq and licensed under Apache 2.0.
 
 | Technology | Version |
 |---|---|
-| Java | 25 (GraalVM Community Edition) |
+| Java | 25 (any JDK — Temurin, Corretto, GraalVM CE, etc.) |
 | Maven | 3.9+ |
 | Lombok | 1.18.x (annotation-processor only — not a runtime dep) |
 | picocli | 4.7.x |
@@ -20,7 +20,6 @@ Abdalla Bushnaq and licensed under Apache 2.0.
 | Jackson | 2.17.x |
 | SLF4J + Logback | 2.0.x / 1.5.x |
 | JUnit Jupiter | 5.10.x |
-| GraalVM native-maven-plugin | 0.10.x |
 
 ---
 
@@ -97,13 +96,9 @@ Dashes are converted to spaces for the YouTube title.  The YouTube title carries
 # Compile and run tests
 mvn test
 
-# Fat JAR (no external deps)
+# Fat JAR (all dependencies shaded in)
 mvn package -DskipTests
-# Output: target/youtube-sync-1.0.0-SNAPSHOT.jar
-
-# Native image (requires GraalVM JDK 25 on PATH)
-mvn -Pnative package -DskipTests
-# Output: target/youtube-sync  (Linux/macOS)  or  target/youtube-sync.exe  (Windows)
+# Output: target/youtube-sync.jar
 ```
 
 ---
@@ -134,14 +129,10 @@ mvn test
 Workflow: `.github/workflows/native-image.yml`
 
 - Triggers on push/PR to `main`.
-- Matrix: **Linux x86-64** · **macOS arm64** · **Windows x86-64**, all with `fail-fast: false`.
-- Sets up **GraalVM CE JDK 25** via `graalvm/setup-graalvm@v1`.
+- Single job running on **ubuntu-latest** with **Temurin JDK 25**.
 - Caches the Maven local repository keyed on `pom.xml`.
-- Runs `mvn -Pnative package -DskipTests`.
-- Uploads binaries as workflow artifacts:
-  - `youtube-sync-linux-x86_64`
-  - `youtube-sync-macos-arm64`
-  - `youtube-sync-windows-x86_64`  (`.exe`)
+- Runs `mvn package -DskipTests`.
+- Uploads `target/youtube-sync.jar` as the `youtube-sync` workflow artifact (retained 30 days).
 
 ---
 

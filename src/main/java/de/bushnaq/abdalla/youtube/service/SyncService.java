@@ -18,7 +18,10 @@ package de.bushnaq.abdalla.youtube.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.client.http.FileContent;
-import com.google.api.services.youtube.model.*;
+import com.google.api.services.youtube.model.PlaylistItem;
+import com.google.api.services.youtube.model.PlaylistItemListResponse;
+import com.google.api.services.youtube.model.VideoSnippet;
+import com.google.api.services.youtube.model.VideoStatus;
 import de.bushnaq.abdalla.youtube.dto.OldVersionStrategy;
 import de.bushnaq.abdalla.youtube.dto.SyncAction;
 import de.bushnaq.abdalla.youtube.dto.SyncAction.Kind;
@@ -59,45 +62,32 @@ import java.util.stream.Stream;
 @Slf4j
 public class SyncService {
 
-    /** Video file extensions recognised by this tool. */
-    private static final Set<String> VIDEO_EXTENSIONS = Set.of(
-            ".mp4", ".mov", ".mkv", ".avi", ".webm"
-    );
-
+    /**
+     * Matches a YouTube title suffix {@code " v<digits>"} at the end of the string.
+     * Example: {@code " v3"} → group 1 = {@code "3"}.
+     */
+    private static final Pattern TITLE_VERSION_PATTERN = Pattern.compile("^ v([0-9]+)$");
     /**
      * Matches a filename stem ending with {@code -<digits>}.
      * Example: {@code "My-Product-Intro-2"} → group 1 = {@code "My-Product-Intro"},
      * group 2 = {@code "2"}.
      */
     private static final Pattern VERSION_PATTERN = Pattern.compile("^(.*)-([0-9]+)$");
-
     /**
-     * Matches a YouTube title suffix {@code " v<digits>"} at the end of the string.
-     * Example: {@code " v3"} → group 1 = {@code "3"}.
+     * Video file extensions recognised by this tool.
      */
-    private static final Pattern TITLE_VERSION_PATTERN = Pattern.compile("^ v([0-9]+)$");
+    private static final Set<String> VIDEO_EXTENSIONS = Set.of(
+            ".mp4", ".mov", ".mkv", ".avi", ".webm"
+    );
 
     // -------------------------------------------------------------------------
     // ANSI colour codes used in the plan table's Action column
     // -------------------------------------------------------------------------
-
-    /**
-     * Wraps {@code text} in Jansi bright-colour codes for the plan table's Action column.
-     *
-     * @param color the bright foreground colour to apply
-     * @param text  the text to colour (must already be padded to the desired visible width)
-     * @return a string that renders in the given colour on ANSI-capable terminals
-     */
-    private static String colored(Ansi.Color color, String text) {
-        return Ansi.ansi().fgBright(color).a(text).reset().toString();
-    }
-
-    private final YouTubeGateway gateway;
-    private final ObjectMapper objectMapper;
+    private final boolean            dryRun;
+    private final YouTubeGateway     gateway;
+    private final ObjectMapper       objectMapper;
     private final OldVersionStrategy oldVersionStrategy;
-    private final QuotaTracker quotaTracker;
-    private final boolean dryRun;
-
+    private final QuotaTracker       quotaTracker;
     /**
      * Constructs a {@code SyncService}.
      *
@@ -108,11 +98,34 @@ public class SyncService {
      */
     public SyncService(YouTubeGateway gateway, OldVersionStrategy oldVersionStrategy,
                        QuotaTracker quotaTracker, boolean dryRun) {
-        this.gateway = gateway;
+        this.gateway            = gateway;
         this.oldVersionStrategy = oldVersionStrategy;
-        this.quotaTracker = quotaTracker;
-        this.dryRun = dryRun;
-        this.objectMapper = new ObjectMapper();
+        this.quotaTracker       = quotaTracker;
+        this.dryRun             = dryRun;
+        this.objectMapper       = new ObjectMapper();
+    }
+
+    /**
+     * Adds the given video to a YouTube playlist.
+     *
+     * @param videoId    the YouTube video ID to add
+     * @param playlistId the target playlist ID; skipped if {@code null} or blank
+     * @throws IOException            on API failure
+     * @throws QuotaExceededException if quota is exhausted
+     */
+    private void addToPlaylist(String videoId, String playlistId) throws IOException {
+        if (playlistId == null || playlistId.isBlank()) {
+            log.debug("No playlistId set — skipping playlist insertion for videoId={}", videoId);
+            return;
+        }
+        quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_INSERT, "playlistItems.insert");
+        try {
+            gateway.insertPlaylistItem(videoId, playlistId);
+            log.info("Added videoId={} to playlist {}", videoId, playlistId);
+        } catch (GoogleJsonResponseException e) {
+            checkQuota(e);
+            throw e;
+        }
     }
 
     // =========================================================================
@@ -120,46 +133,53 @@ public class SyncService {
     // =========================================================================
 
     /**
-     * Runs the full synchronisation pass over the given folder.
+     * Applies quota constraints to the plan by replacing budget-blocked {@link Kind#UPLOAD}
+     * actions with {@link Kind#QUOTA}.
      *
-     * <p>Phase 1: build a {@link SyncAction} for every video file (no mutations).<br>
-     * Phase 2 (dry-run only): print the plan table and quota projection to the console, then
-     * exit without uploading anything.<br>
-     * Phase 3 (live only): execute uploads, printing a per-video progress bar to the console.
+     * <p>Each {@code UPLOAD} action is consumed against a simulated copy of the remaining
+     * budget.  When the budget runs out before an upload can be served, that action is
+     * downgraded to {@code QUOTA} and a warning is written to the log.  No quota is actually
+     * charged here — this is a projection only.
      *
-     * @param folder the watched video folder
-     * @throws IOException if the folder cannot be listed
+     * <p>Cost per upload: {@code videos.insert} (1,600) + {@code playlistItems.insert} (50)
+     * = 1,650 units.  Old-version handling is ignored as it is conditional and cheap.
+     *
+     * @param plan the raw plan produced by {@link #buildPlan}
+     * @return a new list identical to {@code plan} except that budget-blocked uploads are
+     * replaced by {@link Kind#QUOTA} actions
      */
-    public void sync(Path folder) throws IOException {
-        List<Path> videoFiles = listVideoFiles(folder);
-        log.info("Found {} video file(s) in {}", videoFiles.size(), folder);
-
-        // --- Phase 1a: validate playlists ---
-        Set<String> referencedPlaylists = collectPlaylistIds(videoFiles, folder);
-        if (!validatePlaylists(referencedPlaylists)) {
-            log.error("Aborting sync due to missing playlist(s). Fix the sidecar JSON files and retry.");
-            return;
+    private List<SyncAction> applyQuotaConstraints(List<SyncAction> plan) {
+        final int        costPerUpload = QuotaTracker.COST_VIDEO_INSERT + QuotaTracker.COST_PLAYLIST_ITEM_INSERT;
+        int              remaining     = quotaTracker.remaining();
+        int              deferred      = 0;
+        List<SyncAction> result        = new ArrayList<>(plan.size());
+        for (SyncAction action : plan) {
+            if (action.kind() == Kind.UPLOAD) {
+                if (remaining >= costPerUpload) {
+                    remaining -= costPerUpload;
+                    result.add(action);
+                } else {
+                    log.warn("QUOTA-deferred: {} (needs {} units, only {} remaining)",
+                            action.filename(), costPerUpload, remaining);
+                    result.add(action.withKind(Kind.QUOTA));
+                    deferred++;
+                }
+            } else {
+                result.add(action);
+            }
         }
-
-        // --- Phase 1b: build plan ---
-        List<SyncAction> plan = buildPlan(videoFiles, folder);
-
-        // --- Phase 1c: apply quota constraints (marks budget-blocked uploads as QUOTA) ---
-        plan = applyQuotaConstraints(plan);
-
-        if (dryRun) {
-            // --- Phase 2 (dry-run): show plan table, then stop ---
-            printPlanTable(plan);
-            log.info("[DRY-RUN] Execute phase skipped — no changes made to YouTube.");
-            printSummary(plan);
-            return;
+        if (deferred > 0) {
+            System.out.println("──────────────────────────────────────────────────────────");
+            System.out.println("QUOTA: not enough estimated quota for all uploads.");
+            System.out.printf("  Remaining budget : %d units%n", quotaTracker.remaining());
+            System.out.printf("  Cost per upload  : %d units (videos.insert + playlistItems.insert)%n",
+                    costPerUpload);
+            System.out.printf("  %d upload(s) deferred to the next run (see log for details).%n", deferred);
+            System.out.println("  Increase --quota-budget or wait for the daily quota to reset.");
+            System.out.println("──────────────────────────────────────────────────────────");
+            System.out.println();
         }
-
-        // --- Phase 3: execute ---
-        executePlan(plan);
-
-        log.info(quotaTracker.summary());
-        printSummary(plan);
+        return result;
     }
 
     /**
@@ -184,47 +204,15 @@ public class SyncService {
     // =========================================================================
 
     /**
-     * Determines the {@link SyncAction} for a single video file.
+     * Builds the YouTube title for the given base title and version number.
+     * Version 1 has no suffix; v2+ get {@code " v<n>"} appended.
      *
-     * @param folder    the watched folder
-     * @param videoFile absolute path to the video file
-     * @return the planned action
+     * @param baseTitle the base title (spaces, no version suffix)
+     * @param version   the version number (&gt;= 1)
+     * @return the YouTube title string
      */
-    private SyncAction planFile(Path folder, Path videoFile) {
-        String filename = videoFile.getFileName().toString();
-        String stem = stripExtension(filename);
-
-        Matcher m = VERSION_PATTERN.matcher(stem);
-        if (!m.matches()) {
-            return new SyncAction(videoFile, filename, null, -1, -1, null, Kind.ERROR,
-                    "Filename stem does not end with '-<number>' (e.g. My-Video-1.mp4)");
-        }
-        String dashBaseTitle = m.group(1);
-        int localVersion     = Integer.parseInt(m.group(2));
-        String baseTitle     = dashBaseTitle.replace('-', ' ');
-
-        VideoMetadata metadata;
-        try {
-            metadata = loadMetadata(folder, filename);
-        } catch (IOException e) {
-            return new SyncAction(videoFile, filename, baseTitle, localVersion, -1, null,
-                    Kind.ERROR, "Cannot read sidecar JSON: " + e.getMessage());
-        }
-
-        int remoteVersion;
-        try {
-            remoteVersion = fetchRemoteVersion(metadata.getPlaylistId(), baseTitle);
-        } catch (QuotaBudgetExceededException e) {
-            throw e; // propagate immediately — stops the whole plan phase
-        } catch (IOException e) {
-            return new SyncAction(videoFile, filename, baseTitle, localVersion, -1,
-                    metadata.getPlaylistId(), Kind.ERROR,
-                    "Cannot fetch remote version: " + e.getMessage());
-        }
-
-        Kind kind = localVersion > remoteVersion ? Kind.UPLOAD : Kind.SKIP;
-        return new SyncAction(videoFile, filename, baseTitle, localVersion, remoteVersion,
-                metadata.getPlaylistId(), kind, null);
+    private String buildTitle(String baseTitle, int version) {
+        return version == 1 ? baseTitle : baseTitle + " v" + version;
     }
 
     // =========================================================================
@@ -232,135 +220,63 @@ public class SyncService {
     // =========================================================================
 
     /**
-     * Prints a formatted plan table to {@code System.out} so the operator sees every file and
-     * its intended action before any upload begins.
+     * Inspects a {@link GoogleJsonResponseException} and throws {@link QuotaExceededException}
+     * if the error reason indicates quota exhaustion.
      *
-     * <p>Example:
-     * <pre>
-     * ┌──────────────────────────────────┬────────┬───────┬────────┐
-     * │ File                             │ Action │ Local │ Remote │
-     * ├──────────────────────────────────┼────────┼───────┼────────┤
-     * │ My-Product-Intro-1.mp4           │ UPLOAD │   1   │   0    │
-     * │ My-Video-3-1.mp4                 │ QUOTA  │   1   │   0    │
-     * │ My-Release-Notes-2.mp4           │  SKIP  │   2   │   2    │
-     * │ bad-filename.mp4                 │  ERR   │   -   │   -    │
-     * └──────────────────────────────────┴────────┴───────┴────────┘
-     * </pre>
-     *
-     * @param plan the list of planned actions
+     * @param e the API exception to inspect
+     * @throws QuotaExceededException if the error is a quota error
      */
-    public void printPlanTable(List<SyncAction> plan) {
-        // Compute column widths
-         int fileCol = Math.max(80, plan.stream()
-                .mapToInt(a -> a.filename().length()).max().orElse(40));
-
-        String top = "┌" + "─".repeat(fileCol) + "──┬────────┬───────┬────────┐";
-        String mid = "├" + "─".repeat(fileCol) + "──┼────────┼───────┼────────┤";
-        String bot = "└" + "─".repeat(fileCol) + "──┴────────┴───────┴────────┘";
-
-        System.out.println();
-        System.out.println(top);
-        System.out.printf("│ %-" + fileCol + "s │ Action │ Local │ Remote │%n", "File");
-        System.out.println(mid);
-
-        // Width available for text inside the file cell (between "│ " and " │")
-        final int cellWidth = fileCol;
-        // Width available for the error message after the " -> " prefix (4 ASCII chars)
-        final int msgWidth  = cellWidth - 4;
-
-        for (SyncAction a : plan) {
-            // Each label is exactly 6 visible characters so %s keeps the column aligned
-            // even though the Jansi escape bytes make the String longer than 6.
-            String action = switch (a.kind()) {
-                case UPLOAD -> colored(Ansi.Color.GREEN,  "UPLOAD");
-                case QUOTA  -> colored(Ansi.Color.YELLOW, "QUOTA ");
-                case SKIP   -> colored(Ansi.Color.BLUE,   " SKIP ");
-                case ERROR  -> colored(Ansi.Color.RED,    " ERR  ");
-            };
-            String local  = a.localVersion()  >= 0 ? String.valueOf(a.localVersion())  : "-";
-            String remote = a.remoteVersion() >= 0 ? String.valueOf(a.remoteVersion()) : "-";
-            System.out.printf("│ %-" + cellWidth + "s │ %s │  %-5s│  %-5s │%n",
-                    a.filename(), action, local, remote);
-            if (a.kind() == Kind.ERROR && a.errorMessage() != null) {
-                // Wrap the error message into lines of at most msgWidth characters
-                String remaining = a.errorMessage();
-                boolean first = true;
-                while (!remaining.isEmpty()) {
-                    String chunk;
-                    if (remaining.length() <= msgWidth) {
-                        chunk = remaining;
-                        remaining = "";
-                    } else {
-                        // Break at the last space within msgWidth, or hard-break if none
-                        int breakAt = remaining.lastIndexOf(' ', msgWidth);
-                        if (breakAt <= 0) breakAt = msgWidth;
-                        chunk     = remaining.substring(0, breakAt).stripTrailing();
-                        remaining = remaining.substring(breakAt).stripLeading();
-                    }
-                    String prefix = first ? " -> " : "    ";
-                    first = false;
-                    System.out.printf("│ %-" + cellWidth + "s │        │       │        │%n",
-                            prefix + chunk);
-                }
+    private void checkQuota(GoogleJsonResponseException e) {
+        if (e.getDetails() != null && e.getDetails().getErrors() != null) {
+            boolean isQuota = e.getDetails().getErrors().stream()
+                    .anyMatch(err -> "quotaExceeded".equals(err.getReason())
+                            || "dailyLimitExceeded".equals(err.getReason()));
+            if (isQuota) {
+                throw new QuotaExceededException(
+                        "YouTube API quota exceeded: " + e.getDetails().getMessage());
             }
         }
-        System.out.println(bot);
-        System.out.println();
     }
 
     /**
-     * Applies quota constraints to the plan by replacing budget-blocked {@link Kind#UPLOAD}
-     * actions with {@link Kind#QUOTA}.
+     * Collects the set of distinct playlist IDs referenced across all sidecar JSON files.
      *
-     * <p>Each {@code UPLOAD} action is consumed against a simulated copy of the remaining
-     * budget.  When the budget runs out before an upload can be served, that action is
-     * downgraded to {@code QUOTA} and a warning is written to the log.  No quota is actually
-     * charged here — this is a projection only.
-     *
-     * <p>Cost per upload: {@code videos.insert} (1,600) + {@code playlistItems.insert} (50)
-     * = 1,650 units.  Old-version handling is ignored as it is conditional and cheap.
-     *
-     * @param plan the raw plan produced by {@link #buildPlan}
-     * @return a new list identical to {@code plan} except that budget-blocked uploads are
-     *         replaced by {@link Kind#QUOTA} actions
+     * @param videoFiles list of video file paths
+     * @param folder     the watched folder
+     * @return set of playlist IDs (never {@code null}; may be empty)
      */
-    private List<SyncAction> applyQuotaConstraints(List<SyncAction> plan) {
-        final int costPerUpload = QuotaTracker.COST_VIDEO_INSERT + QuotaTracker.COST_PLAYLIST_ITEM_INSERT;
-        int remaining = quotaTracker.remaining();
-        int deferred  = 0;
-        List<SyncAction> result = new ArrayList<>(plan.size());
-        for (SyncAction action : plan) {
-            if (action.kind() == Kind.UPLOAD) {
-                if (remaining >= costPerUpload) {
-                    remaining -= costPerUpload;
-                    result.add(action);
-                } else {
-                    log.warn("QUOTA-deferred: {} (needs {} units, only {} remaining)",
-                            action.filename(), costPerUpload, remaining);
-                    result.add(action.withKind(Kind.QUOTA));
-                    deferred++;
+    private Set<String> collectPlaylistIds(List<Path> videoFiles, Path folder) {
+        Set<String> ids = new LinkedHashSet<>();
+        for (Path vf : videoFiles) {
+            String filename = vf.getFileName().toString();
+            Path   sidecar  = folder.resolve(stripExtension(filename) + ".json");
+            if (!sidecar.toFile().exists()) continue;
+            try {
+                VideoMetadata metadata = objectMapper.readValue(sidecar.toFile(), VideoMetadata.class);
+                if (metadata.getPlaylistId() != null && !metadata.getPlaylistId().isBlank()) {
+                    ids.add(metadata.getPlaylistId());
                 }
-            } else {
-                result.add(action);
+            } catch (IOException e) {
+                log.warn("Could not parse sidecar {}: {}", sidecar.getFileName(), e.getMessage());
             }
         }
-        if (deferred > 0) {
-            System.out.println("──────────────────────────────────────────────────────────");
-            System.out.println("QUOTA: not enough estimated quota for all uploads.");
-            System.out.printf ("  Remaining budget : %d units%n", quotaTracker.remaining());
-            System.out.printf ("  Cost per upload  : %d units (videos.insert + playlistItems.insert)%n",
-                    costPerUpload);
-            System.out.printf ("  %d upload(s) deferred to the next run (see log for details).%n", deferred);
-            System.out.println("  Increase --quota-budget or wait for the daily quota to reset.");
-            System.out.println("──────────────────────────────────────────────────────────");
-            System.out.println();
-        }
-        return result;
+        return ids;
     }
 
     // =========================================================================
     // Execute phase
     // =========================================================================
+
+    /**
+     * Wraps {@code text} in Jansi bright-colour codes for the plan table's Action column.
+     *
+     * @param color the bright foreground colour to apply
+     * @param text  the text to colour (must already be padded to the desired visible width)
+     * @return a string that renders in the given colour on ANSI-capable terminals
+     */
+    private static String colored(Ansi.Color color, String text) {
+        return Ansi.ansi().fgBright(color).a(text).reset().toString();
+    }
 
     /**
      * Executes all {@link Kind#UPLOAD} actions in the plan, in order.
@@ -371,7 +287,7 @@ public class SyncService {
     private void executePlan(List<SyncAction> plan) {
         long uploadCount = plan.stream().filter(a -> a.kind() == Kind.UPLOAD).count();
         int  uploadIndex = 0;
-        int  maxFilenameWidth = plan.stream()
+        int maxFilenameWidth = plan.stream()
                 .filter(a -> a.kind() == Kind.UPLOAD)
                 .mapToInt(a -> a.filename().length())
                 .max()
@@ -400,6 +316,10 @@ public class SyncService {
             }
         }
     }
+
+    // =========================================================================
+    // API helpers
+    // =========================================================================
 
     /**
      * Uploads a single video, adds it to the playlist, and handles the old version.
@@ -433,10 +353,6 @@ public class SyncService {
         }
     }
 
-    // =========================================================================
-    // API helpers
-    // =========================================================================
-
     /**
      * Scans the given playlist and returns the highest version number found for videos whose
      * title starts with {@code baseTitle} (case-insensitive prefix match).
@@ -454,7 +370,7 @@ public class SyncService {
             return 0;
         }
         String lowerBase = baseTitle.toLowerCase(Locale.ROOT);
-        int highest = 0;
+        int    highest   = 0;
         String pageToken = null;
         do {
             quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_LIST, "playlistItems.list");
@@ -501,7 +417,7 @@ public class SyncService {
             throws IOException {
         if (playlistId == null || playlistId.isBlank()) return null;
         String expectedTitle = buildTitle(baseTitle, targetVersion);
-        String pageToken = null;
+        String pageToken     = null;
         do {
             quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_LIST, "playlistItems.list");
             PlaylistItemListResponse resp;
@@ -523,6 +439,351 @@ public class SyncService {
 
         log.warn("Could not find videoId for '{}' (v{}) in playlist {}", baseTitle, targetVersion, playlistId);
         return null;
+    }
+
+    /**
+     * Guesses the MIME type of a video file by its extension.
+     *
+     * @param file the video file path
+     * @return a MIME type string; falls back to {@code "video/mp4"} for unknown extensions
+     */
+    private String guessMimeType(Path file) {
+        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
+        if (name.endsWith(".mp4")) return "video/mp4";
+        if (name.endsWith(".mov")) return "video/quicktime";
+        if (name.endsWith(".mkv")) return "video/x-matroska";
+        if (name.endsWith(".avi")) return "video/x-msvideo";
+        if (name.endsWith(".webm")) return "video/webm";
+        return "video/mp4";
+    }
+
+    /**
+     * Handles the old video version according to the configured {@link OldVersionStrategy}.
+     *
+     * @param oldVideoId the YouTube video ID of the old version
+     * @param playlistId the playlist from which to remove the old video (KEEP strategy)
+     * @throws IOException            on API failure
+     * @throws QuotaExceededException if quota is exhausted
+     */
+    private void handleOldVersion(String oldVideoId, String playlistId) throws IOException {
+        if (oldVersionStrategy == OldVersionStrategy.DELETE) {
+            log.info("Strategy=DELETE — deleting old videoId={}", oldVideoId);
+            quotaTracker.charge(QuotaTracker.COST_VIDEO_DELETE, "videos.delete");
+            try {
+                gateway.deleteVideo(oldVideoId);
+                log.info("Deleted old videoId={}", oldVideoId);
+            } catch (GoogleJsonResponseException e) {
+                checkQuota(e);
+                throw e;
+            }
+        } else {
+            log.info("Strategy=KEEP — removing old videoId={} from playlist {}", oldVideoId, playlistId);
+            removeFromPlaylist(oldVideoId, playlistId);
+        }
+    }
+
+    /**
+     * Returns a human-readable file size string (e.g. {@code "142.3 MB"}).
+     *
+     * @param bytes file size in bytes
+     * @return formatted size string
+     */
+    private String humanReadableSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        double kb = bytes / 1024.0;
+        if (kb < 1024) return String.format("%.1f KB", kb);
+        double mb = kb / 1024.0;
+        if (mb < 1024) return String.format("%.1f MB", mb);
+        return String.format("%.1f GB", mb / 1024.0);
+    }
+
+    // =========================================================================
+    // Playlist / metadata helpers
+    // =========================================================================
+
+    /**
+     * Returns {@code true} if the filename has a recognised video extension.
+     *
+     * @param filename the filename to check
+     * @return {@code true} for recognised video files
+     */
+    private boolean isVideoFile(String filename) {
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0) return false;
+        return VIDEO_EXTENSIONS.contains(filename.substring(dot).toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * Lists all video files in the given folder (non-recursive), sorted by filename.
+     *
+     * @param folder the folder to scan
+     * @return sorted list of video file paths
+     * @throws IOException if the folder cannot be read
+     */
+    private List<Path> listVideoFiles(Path folder) throws IOException {
+        try (Stream<Path> stream = Files.list(folder)) {
+            return stream
+                    .filter(p -> !Files.isDirectory(p))
+                    .filter(p -> isVideoFile(p.getFileName().toString()))
+                    .sorted(Comparator.comparing(p -> p.getFileName().toString()))
+                    .toList();
+        }
+    }
+
+    /**
+     * Loads and deserialises the sidecar JSON file for a given video filename.
+     * If the sidecar does not exist, a {@link VideoMetadata} with defaults is returned.
+     *
+     * @param folder   the watched folder
+     * @param filename the video filename (no path component)
+     * @return the parsed {@link VideoMetadata}
+     * @throws IOException if the sidecar exists but cannot be parsed
+     */
+    private VideoMetadata loadMetadata(Path folder, String filename) throws IOException {
+        Path sidecar = folder.resolve(stripExtension(filename) + ".json");
+        if (sidecar.toFile().exists()) {
+            return objectMapper.readValue(sidecar.toFile(), VideoMetadata.class);
+        }
+        log.warn("No sidecar JSON found for {} — using default settings", filename);
+        return new VideoMetadata();
+    }
+
+    /**
+     * Determines the {@link SyncAction} for a single video file.
+     *
+     * @param folder    the watched folder
+     * @param videoFile absolute path to the video file
+     * @return the planned action
+     */
+    private SyncAction planFile(Path folder, Path videoFile) {
+        String filename = videoFile.getFileName().toString();
+        String stem     = stripExtension(filename);
+
+        Matcher m = VERSION_PATTERN.matcher(stem);
+        if (!m.matches()) {
+            return new SyncAction(videoFile, filename, null, -1, -1, null, Kind.ERROR,
+                    "Filename stem does not end with '-<number>' (e.g. My-Video-1.mp4)");
+        }
+        String dashBaseTitle = m.group(1);
+        int    localVersion  = Integer.parseInt(m.group(2));
+        String baseTitle     = dashBaseTitle.replace('-', ' ');
+
+        VideoMetadata metadata;
+        try {
+            metadata = loadMetadata(folder, filename);
+        } catch (IOException e) {
+            return new SyncAction(videoFile, filename, baseTitle, localVersion, -1, null,
+                    Kind.ERROR, "Cannot read sidecar JSON: " + e.getMessage());
+        }
+
+        int remoteVersion;
+        try {
+            remoteVersion = fetchRemoteVersion(metadata.getPlaylistId(), baseTitle);
+        } catch (QuotaBudgetExceededException e) {
+            throw e; // propagate immediately — stops the whole plan phase
+        } catch (IOException e) {
+            return new SyncAction(videoFile, filename, baseTitle, localVersion, -1,
+                    metadata.getPlaylistId(), Kind.ERROR,
+                    "Cannot fetch remote version: " + e.getMessage());
+        }
+
+        Kind kind = localVersion > remoteVersion ? Kind.UPLOAD : Kind.SKIP;
+        return new SyncAction(videoFile, filename, baseTitle, localVersion, remoteVersion,
+                metadata.getPlaylistId(), kind, null);
+    }
+
+    // =========================================================================
+    // Small utilities
+    // =========================================================================
+
+    /**
+     * Prints a formatted plan table to {@code System.out} so the operator sees every file and
+     * its intended action before any upload begins.
+     *
+     * <p>Example:
+     * <pre>
+     * ┌──────────────────────────────────┬────────┬───────┬────────┐
+     * │ File                             │ Action │ Local │ Remote │
+     * ├──────────────────────────────────┼────────┼───────┼────────┤
+     * │ My-Product-Intro-1.mp4           │ UPLOAD │   1   │   0    │
+     * │ My-Video-3-1.mp4                 │ QUOTA  │   1   │   0    │
+     * │ My-Release-Notes-2.mp4           │  SKIP  │   2   │   2    │
+     * │ bad-filename.mp4                 │  ERR   │   -   │   -    │
+     * └──────────────────────────────────┴────────┴───────┴────────┘
+     * </pre>
+     *
+     * @param plan the list of planned actions
+     */
+    public void printPlanTable(List<SyncAction> plan) {
+        // Compute column widths
+        int fileCol = Math.max(80, plan.stream()
+                .mapToInt(a -> a.filename().length()).max().orElse(40));
+
+        // Unicode box-drawing characters render correctly when App.configureWindowsConsole()
+        // has switched the console to UTF-8 + enabled Virtual Terminal Processing (done in
+        // main() before any output is produced).
+        String top = "┌" + "─".repeat(fileCol) + "──┬────────┬───────┬────────┐";
+        String mid = "├" + "─".repeat(fileCol) + "──┼────────┼───────┼────────┤";
+        String bot = "└" + "─".repeat(fileCol) + "──┴────────┴───────┴────────┘";
+
+        System.out.println();
+        System.out.println(top);
+        System.out.printf("│ %-" + fileCol + "s │ Action │ Local │ Remote │%n", "File");
+        System.out.println(mid);
+
+        // Width available for text inside the file cell (between "│ " and " │")
+        final int cellWidth = fileCol;
+        // Width available for the error message after the " -> " prefix (4 ASCII chars)
+        final int msgWidth = cellWidth - 4;
+
+        for (SyncAction a : plan) {
+            // Each label is exactly 6 visible characters so %s keeps the column aligned
+            // even though the Jansi escape bytes make the String longer than 6.
+            String action = switch (a.kind()) {
+                case UPLOAD -> colored(Ansi.Color.GREEN, "UPLOAD");
+                case QUOTA -> colored(Ansi.Color.YELLOW, "QUOTA ");
+                case SKIP -> colored(Ansi.Color.BLUE, " SKIP ");
+                case ERROR -> colored(Ansi.Color.RED, " ERR  ");
+            };
+            String local  = a.localVersion() >= 0 ? String.valueOf(a.localVersion()) : "-";
+            String remote = a.remoteVersion() >= 0 ? String.valueOf(a.remoteVersion()) : "-";
+            System.out.printf("│ %-" + cellWidth + "s │ %s │  %-5s│  %-5s │%n",
+                    a.filename(), action, local, remote);
+            if (a.kind() == Kind.ERROR && a.errorMessage() != null) {
+                // Wrap the error message into lines of at most msgWidth characters
+                String  remaining = a.errorMessage();
+                boolean first     = true;
+                while (!remaining.isEmpty()) {
+                    String chunk;
+                    if (remaining.length() <= msgWidth) {
+                        chunk     = remaining;
+                        remaining = "";
+                    } else {
+                        // Break at the last space within msgWidth, or hard-break if none
+                        int breakAt = remaining.lastIndexOf(' ', msgWidth);
+                        if (breakAt <= 0) breakAt = msgWidth;
+                        chunk     = remaining.substring(0, breakAt).stripTrailing();
+                        remaining = remaining.substring(breakAt).stripLeading();
+                    }
+                    String prefix = first ? " -> " : "    ";
+                    first = false;
+                    System.out.printf("│ %-" + cellWidth + "s │        │       │        │%n",
+                            prefix + chunk);
+                }
+            }
+        }
+        System.out.println(bot);
+        System.out.println();
+    }
+
+    /**
+     * Prints a summary of the sync run to {@code System.out}.
+     *
+     * @param plan the list of planned actions
+     */
+    private void printSummary(List<SyncAction> plan) {
+        long uploads = plan.stream().filter(a -> a.kind() == Kind.UPLOAD).count();
+        long quotas  = plan.stream().filter(a -> a.kind() == Kind.QUOTA).count();
+        long skips   = plan.stream().filter(a -> a.kind() == Kind.SKIP).count();
+        long errs    = plan.stream().filter(a -> a.kind() == Kind.ERROR).count();
+        System.out.println("─────────────────────────────────────────");
+        System.out.println("Sync summary");
+        System.out.printf("  Files scanned  : %d%n", plan.size());
+        System.out.printf("  Uploaded       : %s%n", dryRun ? "0 (dry-run)" : uploads);
+        System.out.printf("  Quota-deferred : %d%n", quotas);
+        System.out.printf("  Skipped        : %d%n", skips);
+        System.out.printf("  Errors         : %d%n", errs);
+        System.out.println("─────────────────────────────────────────");
+    }
+
+    /**
+     * Removes a specific video from a playlist by finding its playlist-item entry and deleting it.
+     *
+     * @param videoId    the YouTube video ID to remove
+     * @param playlistId the playlist to remove it from
+     * @throws IOException            on API failure
+     * @throws QuotaExceededException if quota is exhausted
+     */
+    private void removeFromPlaylist(String videoId, String playlistId) throws IOException {
+        if (playlistId == null || playlistId.isBlank()) {
+            log.debug("No playlistId — nothing to remove for old videoId={}", videoId);
+            return;
+        }
+        try {
+            String pageToken = null;
+            do {
+                quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_LIST, "playlistItems.list");
+                PlaylistItemListResponse response = gateway.listPlaylistItems(playlistId, pageToken);
+                for (PlaylistItem item : response.getItems()) {
+                    if (videoId.equals(item.getSnippet().getResourceId().getVideoId())) {
+                        quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_DELETE, "playlistItems.delete");
+                        gateway.deletePlaylistItem(item.getId());
+                        log.info("Removed old videoId={} (playlistItemId={}) from playlist {}",
+                                videoId, item.getId(), playlistId);
+                        return;
+                    }
+                }
+                pageToken = response.getNextPageToken();
+            } while (pageToken != null);
+            log.warn("Old videoId={} was not found in playlist {} — nothing removed", videoId, playlistId);
+        } catch (GoogleJsonResponseException e) {
+            checkQuota(e);
+            throw e;
+        }
+    }
+
+    /**
+     * Strips the file extension from a filename.
+     *
+     * @param filename the full filename
+     * @return filename without extension, or the original string if no dot is found
+     */
+    private String stripExtension(String filename) {
+        int dot = filename.lastIndexOf('.');
+        return dot > 0 ? filename.substring(0, dot) : filename;
+    }
+
+    /**
+     * Runs the full synchronisation pass over the given folder.
+     *
+     * <p>Phase 1: build a {@link SyncAction} for every video file (no mutations).<br>
+     * Phase 2 (dry-run only): print the plan table and quota projection to the console, then
+     * exit without uploading anything.<br>
+     * Phase 3 (live only): execute uploads, printing a per-video progress bar to the console.
+     *
+     * @param folder the watched video folder
+     * @throws IOException if the folder cannot be listed
+     */
+    public void sync(Path folder) throws IOException {
+        List<Path> videoFiles = listVideoFiles(folder);
+        log.info("Found {} video file(s) in {}", videoFiles.size(), folder);
+
+        // --- Phase 1a: validate playlists ---
+        Set<String> referencedPlaylists = collectPlaylistIds(videoFiles, folder);
+        if (!validatePlaylists(referencedPlaylists)) {
+            log.error("Aborting sync due to missing playlist(s). Fix the sidecar JSON files and retry.");
+            return;
+        }
+
+        // --- Phase 1b: build plan ---
+        List<SyncAction> plan = buildPlan(videoFiles, folder);
+
+        // --- Phase 1c: apply quota constraints (marks budget-blocked uploads as QUOTA) ---
+        plan = applyQuotaConstraints(plan);
+
+        if (dryRun) {
+            // --- Phase 2 (dry-run): show plan table, then stop ---
+            printPlanTable(plan);
+            log.info("[DRY-RUN] Execute phase skipped — no changes made to YouTube.");
+            printSummary(plan);
+            return;
+        }
+
+        // --- Phase 3: execute ---
+        executePlan(plan);
+
+        log.info(quotaTracker.summary());
+        printSummary(plan);
     }
 
     /**
@@ -563,9 +824,9 @@ public class SyncService {
         VideoStatus status = new VideoStatus();
         status.setPrivacyStatus(metadata.getPrivacyStatus());
 
-        String mimeType = guessMimeType(action.videoFile());
-        FileContent mediaContent = new FileContent(mimeType, action.videoFile().toFile());
-        long fileSizeBytes = action.videoFile().toFile().length();
+        String      mimeType      = guessMimeType(action.videoFile());
+        FileContent mediaContent  = new FileContent(mimeType, action.videoFile().toFile());
+        long        fileSizeBytes = action.videoFile().toFile().length();
 
         log.info("Uploading '{}' ({}) as '{}' ...",
                 action.filename(),
@@ -586,7 +847,7 @@ public class SyncService {
                     switch (state) {
                         case INITIATING -> log.info("Upload initialising ...");
                         case IN_PROGRESS -> pb.stepTo((long) percent * fileSizeBytes / 100);
-                        case COMPLETE    -> pb.stepTo(fileSizeBytes);
+                        case COMPLETE -> pb.stepTo(fileSizeBytes);
                     }
                 });
             } catch (GoogleJsonResponseException e) {
@@ -596,119 +857,6 @@ public class SyncService {
         } // pb.close() — bar renders its completed state here
         log.info("Upload complete — videoId={}, title='{}'", videoId, title);
         return videoId;
-    }
-
-    /**
-     * Adds the given video to a YouTube playlist.
-     *
-     * @param videoId    the YouTube video ID to add
-     * @param playlistId the target playlist ID; skipped if {@code null} or blank
-     * @throws IOException            on API failure
-     * @throws QuotaExceededException if quota is exhausted
-     */
-    private void addToPlaylist(String videoId, String playlistId) throws IOException {
-        if (playlistId == null || playlistId.isBlank()) {
-            log.debug("No playlistId set — skipping playlist insertion for videoId={}", videoId);
-            return;
-        }
-        quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_INSERT, "playlistItems.insert");
-        try {
-            gateway.insertPlaylistItem(videoId, playlistId);
-            log.info("Added videoId={} to playlist {}", videoId, playlistId);
-        } catch (GoogleJsonResponseException e) {
-            checkQuota(e);
-            throw e;
-        }
-    }
-
-    /**
-     * Handles the old video version according to the configured {@link OldVersionStrategy}.
-     *
-     * @param oldVideoId the YouTube video ID of the old version
-     * @param playlistId the playlist from which to remove the old video (KEEP strategy)
-     * @throws IOException            on API failure
-     * @throws QuotaExceededException if quota is exhausted
-     */
-    private void handleOldVersion(String oldVideoId, String playlistId) throws IOException {
-        if (oldVersionStrategy == OldVersionStrategy.DELETE) {
-            log.info("Strategy=DELETE — deleting old videoId={}", oldVideoId);
-            quotaTracker.charge(QuotaTracker.COST_VIDEO_DELETE, "videos.delete");
-            try {
-                gateway.deleteVideo(oldVideoId);
-                log.info("Deleted old videoId={}", oldVideoId);
-            } catch (GoogleJsonResponseException e) {
-                checkQuota(e);
-                throw e;
-            }
-        } else {
-            log.info("Strategy=KEEP — removing old videoId={} from playlist {}", oldVideoId, playlistId);
-            removeFromPlaylist(oldVideoId, playlistId);
-        }
-    }
-
-    /**
-     * Removes a specific video from a playlist by finding its playlist-item entry and deleting it.
-     *
-     * @param videoId    the YouTube video ID to remove
-     * @param playlistId the playlist to remove it from
-     * @throws IOException            on API failure
-     * @throws QuotaExceededException if quota is exhausted
-     */
-    private void removeFromPlaylist(String videoId, String playlistId) throws IOException {
-        if (playlistId == null || playlistId.isBlank()) {
-            log.debug("No playlistId — nothing to remove for old videoId={}", videoId);
-            return;
-        }
-        try {
-            String pageToken = null;
-            do {
-                quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_LIST, "playlistItems.list");
-                PlaylistItemListResponse response = gateway.listPlaylistItems(playlistId, pageToken);
-                for (PlaylistItem item : response.getItems()) {
-                    if (videoId.equals(item.getSnippet().getResourceId().getVideoId())) {
-                        quotaTracker.charge(QuotaTracker.COST_PLAYLIST_ITEM_DELETE, "playlistItems.delete");
-                        gateway.deletePlaylistItem(item.getId());
-                        log.info("Removed old videoId={} (playlistItemId={}) from playlist {}",
-                                videoId, item.getId(), playlistId);
-                        return;
-                    }
-                }
-                pageToken = response.getNextPageToken();
-            } while (pageToken != null);
-            log.warn("Old videoId={} was not found in playlist {} — nothing removed", videoId, playlistId);
-        } catch (GoogleJsonResponseException e) {
-            checkQuota(e);
-            throw e;
-        }
-    }
-
-    // =========================================================================
-    // Playlist / metadata helpers
-    // =========================================================================
-
-    /**
-     * Collects the set of distinct playlist IDs referenced across all sidecar JSON files.
-     *
-     * @param videoFiles list of video file paths
-     * @param folder     the watched folder
-     * @return set of playlist IDs (never {@code null}; may be empty)
-     */
-    private Set<String> collectPlaylistIds(List<Path> videoFiles, Path folder) {
-        Set<String> ids = new LinkedHashSet<>();
-        for (Path vf : videoFiles) {
-            String filename = vf.getFileName().toString();
-            Path sidecar = folder.resolve(stripExtension(filename) + ".json");
-            if (!sidecar.toFile().exists()) continue;
-            try {
-                VideoMetadata metadata = objectMapper.readValue(sidecar.toFile(), VideoMetadata.class);
-                if (metadata.getPlaylistId() != null && !metadata.getPlaylistId().isBlank()) {
-                    ids.add(metadata.getPlaylistId());
-                }
-            } catch (IOException e) {
-                log.warn("Could not parse sidecar {}: {}", sidecar.getFileName(), e.getMessage());
-            }
-        }
-        return ids;
     }
 
     /**
@@ -739,151 +887,6 @@ public class SyncService {
             }
         }
         return allOk;
-    }
-
-    /**
-     * Loads and deserialises the sidecar JSON file for a given video filename.
-     * If the sidecar does not exist, a {@link VideoMetadata} with defaults is returned.
-     *
-     * @param folder   the watched folder
-     * @param filename the video filename (no path component)
-     * @return the parsed {@link VideoMetadata}
-     * @throws IOException if the sidecar exists but cannot be parsed
-     */
-    private VideoMetadata loadMetadata(Path folder, String filename) throws IOException {
-        Path sidecar = folder.resolve(stripExtension(filename) + ".json");
-        if (sidecar.toFile().exists()) {
-            return objectMapper.readValue(sidecar.toFile(), VideoMetadata.class);
-        }
-        log.warn("No sidecar JSON found for {} — using default settings", filename);
-        return new VideoMetadata();
-    }
-
-    /**
-     * Lists all video files in the given folder (non-recursive), sorted by filename.
-     *
-     * @param folder the folder to scan
-     * @return sorted list of video file paths
-     * @throws IOException if the folder cannot be read
-     */
-    private List<Path> listVideoFiles(Path folder) throws IOException {
-        try (Stream<Path> stream = Files.list(folder)) {
-            return stream
-                    .filter(p -> !Files.isDirectory(p))
-                    .filter(p -> isVideoFile(p.getFileName().toString()))
-                    .sorted(Comparator.comparing(p -> p.getFileName().toString()))
-                    .toList();
-        }
-    }
-
-    // =========================================================================
-    // Small utilities
-    // =========================================================================
-
-    /**
-     * Returns {@code true} if the filename has a recognised video extension.
-     *
-     * @param filename the filename to check
-     * @return {@code true} for recognised video files
-     */
-    private boolean isVideoFile(String filename) {
-        int dot = filename.lastIndexOf('.');
-        if (dot < 0) return false;
-        return VIDEO_EXTENSIONS.contains(filename.substring(dot).toLowerCase(Locale.ROOT));
-    }
-
-    /**
-     * Strips the file extension from a filename.
-     *
-     * @param filename the full filename
-     * @return filename without extension, or the original string if no dot is found
-     */
-    private String stripExtension(String filename) {
-        int dot = filename.lastIndexOf('.');
-        return dot > 0 ? filename.substring(0, dot) : filename;
-    }
-
-    /**
-     * Builds the YouTube title for the given base title and version number.
-     * Version 1 has no suffix; v2+ get {@code " v<n>"} appended.
-     *
-     * @param baseTitle the base title (spaces, no version suffix)
-     * @param version   the version number (&gt;= 1)
-     * @return the YouTube title string
-     */
-    private String buildTitle(String baseTitle, int version) {
-        return version == 1 ? baseTitle : baseTitle + " v" + version;
-    }
-
-
-    /**
-     * Guesses the MIME type of a video file by its extension.
-     *
-     * @param file the video file path
-     * @return a MIME type string; falls back to {@code "video/mp4"} for unknown extensions
-     */
-    private String guessMimeType(Path file) {
-        String name = file.getFileName().toString().toLowerCase(Locale.ROOT);
-        if (name.endsWith(".mp4"))  return "video/mp4";
-        if (name.endsWith(".mov"))  return "video/quicktime";
-        if (name.endsWith(".mkv"))  return "video/x-matroska";
-        if (name.endsWith(".avi"))  return "video/x-msvideo";
-        if (name.endsWith(".webm")) return "video/webm";
-        return "video/mp4";
-    }
-
-    /**
-     * Returns a human-readable file size string (e.g. {@code "142.3 MB"}).
-     *
-     * @param bytes file size in bytes
-     * @return formatted size string
-     */
-    private String humanReadableSize(long bytes) {
-        if (bytes < 1024) return bytes + " B";
-        double kb = bytes / 1024.0;
-        if (kb < 1024) return String.format("%.1f KB", kb);
-        double mb = kb / 1024.0;
-        if (mb < 1024) return String.format("%.1f MB", mb);
-        return String.format("%.1f GB", mb / 1024.0);
-    }
-
-    /**
-     * Inspects a {@link GoogleJsonResponseException} and throws {@link QuotaExceededException}
-     * if the error reason indicates quota exhaustion.
-     *
-     * @param e the API exception to inspect
-     * @throws QuotaExceededException if the error is a quota error
-     */
-    private void checkQuota(GoogleJsonResponseException e) {
-        if (e.getDetails() != null && e.getDetails().getErrors() != null) {
-            boolean isQuota = e.getDetails().getErrors().stream()
-                    .anyMatch(err -> "quotaExceeded".equals(err.getReason())
-                            || "dailyLimitExceeded".equals(err.getReason()));
-            if (isQuota) {
-                throw new QuotaExceededException(
-                        "YouTube API quota exceeded: " + e.getDetails().getMessage());
-            }
-        }
-    }
-
-    /**
-     * Logs a summary of the sync run using the completed plan.
-     *
-     * @param plan the list of planned actions
-     */
-    private void printSummary(List<SyncAction> plan) {
-        long uploads = plan.stream().filter(a -> a.kind() == Kind.UPLOAD).count();
-        long quotas  = plan.stream().filter(a -> a.kind() == Kind.QUOTA).count();
-        long skips   = plan.stream().filter(a -> a.kind() == Kind.SKIP).count();
-        long errs    = plan.stream().filter(a -> a.kind() == Kind.ERROR).count();
-        log.info("─────────────────────────────────────────");
-        log.info("Sync summary");
-        log.info("  Files scanned  : {}", plan.size());
-        log.info("  Uploaded       : {}", dryRun ? "0 (dry-run)" : uploads);
-        log.info("  Quota-deferred : {}", quotas);
-        log.info("  Skipped        : {}", skips);
-        log.info("  Errors         : {}", errs);
-        log.info("─────────────────────────────────────────");
     }
 
     // =========================================================================

@@ -18,8 +18,13 @@
     "allDeclaredFields": true
   },
   {
-    "name": "com.fasterxml.jackson.databind.ObjectMapper",
+    "name": "ch.qos.logback.classic.filter.ThresholdFilter",
     "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.fasterxml.jackson.databind.ObjectMapper",    "allDeclaredConstructors": true,
     "allDeclaredMethods": true
   },
   {
@@ -55,6 +60,12 @@
     "allDeclaredFields": true
   },
   {
+    "name": "com.google.api.client.auth.oauth2.TokenErrorResponse",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
     "name": "com.google.api.client.auth.oauth2.StoredCredential",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true,
@@ -68,6 +79,48 @@
   },
   {
     "name": "com.google.api.client.googleapis.json.GoogleJsonError$ErrorInfo",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.google.api.client.util.GenericData",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.google.api.client.http.GenericUrl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.google.api.client.auth.oauth2.AuthorizationCodeRequestUrl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.google.api.client.googleapis.auth.oauth2.GoogleAuthorizationCodeRequestUrl",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.google.api.client.auth.oauth2.TokenRequest",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.google.api.client.auth.oauth2.AuthorizationCodeTokenRequest",
+    "allDeclaredConstructors": true,
+    "allDeclaredMethods": true,
+    "allDeclaredFields": true
+  },
+  {
+    "name": "com.google.api.client.googleapis.auth.oauth2.GoogleAuthorizationCodeTokenRequest",
     "allDeclaredConstructors": true,
     "allDeclaredMethods": true,
     "allDeclaredFields": true
