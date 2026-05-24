@@ -28,11 +28,6 @@ import de.bushnaq.abdalla.youtube.dto.SyncAction.Kind;
 import de.bushnaq.abdalla.youtube.dto.VideoMetadata;
 import de.bushnaq.abdalla.youtube.service.QuotaTracker.QuotaBudgetExceededException;
 import lombok.extern.slf4j.Slf4j;
-import me.tongfei.progressbar.ConsoleProgressBarConsumer;
-import me.tongfei.progressbar.ProgressBar;
-import me.tongfei.progressbar.ProgressBarBuilder;
-import me.tongfei.progressbar.ProgressBarStyle;
-import org.fusesource.jansi.Ansi;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -62,34 +57,34 @@ import java.util.stream.Stream;
 @Slf4j
 public class SyncService {
 
+    public static final  int         MAX_TABLE_WIDTH       = 80;
     /**
      * Matches a YouTube title suffix {@code " v<digits>"} at the end of the string.
      * Example: {@code " v3"} → group 1 = {@code "3"}.
      */
-    private static final Pattern TITLE_VERSION_PATTERN = Pattern.compile("^ v([0-9]+)$");
+    private static final Pattern     TITLE_VERSION_PATTERN = Pattern.compile("^ v([0-9]+)$");
     /**
      * Matches a filename stem ending with {@code -<digits>}.
      * Example: {@code "My-Product-Intro-2"} → group 1 = {@code "My-Product-Intro"},
      * group 2 = {@code "2"}.
      */
-    private static final Pattern VERSION_PATTERN = Pattern.compile("^(.*)-([0-9]+)$");
+    private static final Pattern     VERSION_PATTERN       = Pattern.compile("^(.*)-([0-9]+)$");
     /**
      * Video file extensions recognised by this tool.
      */
-    private static final Set<String> VIDEO_EXTENSIONS = Set.of(
+    private static final Set<String> VIDEO_EXTENSIONS      = Set.of(
             ".mp4", ".mov", ".mkv", ".avi", ".webm"
     );
 
-    // -------------------------------------------------------------------------
-    // ANSI colour codes used in the plan table's Action column
-    // -------------------------------------------------------------------------
-    private final boolean            dryRun;
-    private final YouTubeGateway     gateway;
-    private final ObjectMapper       objectMapper;
-    private final OldVersionStrategy oldVersionStrategy;
-    private final QuotaTracker       quotaTracker;
+    private final boolean                dryRun;
+    private final YouTubeGateway         gateway;
+    private final SyncProgressListener   listener;
+    private final ObjectMapper           objectMapper;
+    private final OldVersionStrategy     oldVersionStrategy;
+    private final QuotaTracker           quotaTracker;
+
     /**
-     * Constructs a {@code SyncService}.
+     * Constructs a {@code SyncService} with no progress listener (uses {@link SyncProgressListener#NO_OP}).
      *
      * @param gateway            abstraction over the YouTube Data API
      * @param oldVersionStrategy what to do with old video versions after a re-upload
@@ -98,10 +93,25 @@ public class SyncService {
      */
     public SyncService(YouTubeGateway gateway, OldVersionStrategy oldVersionStrategy,
                        QuotaTracker quotaTracker, boolean dryRun) {
+        this(gateway, oldVersionStrategy, quotaTracker, dryRun, SyncProgressListener.NO_OP);
+    }
+
+    /**
+     * Constructs a {@code SyncService} with an explicit progress listener.
+     *
+     * @param gateway            abstraction over the YouTube Data API
+     * @param oldVersionStrategy what to do with old video versions after a re-upload
+     * @param quotaTracker       tracks and enforces the estimated daily quota budget
+     * @param dryRun             when {@code true} no API mutations are performed
+     * @param listener           receives upload-progress and action-completed events; must not be {@code null}
+     */
+    public SyncService(YouTubeGateway gateway, OldVersionStrategy oldVersionStrategy,
+                       QuotaTracker quotaTracker, boolean dryRun, SyncProgressListener listener) {
         this.gateway            = gateway;
         this.oldVersionStrategy = oldVersionStrategy;
         this.quotaTracker       = quotaTracker;
         this.dryRun             = dryRun;
+        this.listener           = listener != null ? listener : SyncProgressListener.NO_OP;
         this.objectMapper       = new ObjectMapper();
     }
 
@@ -169,15 +179,10 @@ public class SyncService {
             }
         }
         if (deferred > 0) {
-            System.out.println("──────────────────────────────────────────────────────────");
-            System.out.println("QUOTA: not enough estimated quota for all uploads.");
-            System.out.printf("  Remaining budget : %d units%n", quotaTracker.remaining());
-            System.out.printf("  Cost per upload  : %d units (videos.insert + playlistItems.insert)%n",
-                    costPerUpload);
-            System.out.printf("  %d upload(s) deferred to the next run (see log for details).%n", deferred);
-            System.out.println("  Increase --quota-budget or wait for the daily quota to reset.");
-            System.out.println("──────────────────────────────────────────────────────────");
-            System.out.println();
+            log.warn("QUOTA: {} upload(s) deferred to the next run — remaining budget {} units, "
+                    + "cost per upload {} units (videos.insert + playlistItems.insert). "
+                    + "Increase the quota budget or wait for the daily quota to reset.",
+                    deferred, quotaTracker.remaining(), costPerUpload);
         }
         return result;
     }
@@ -274,46 +279,40 @@ public class SyncService {
      * @param text  the text to colour (must already be padded to the desired visible width)
      * @return a string that renders in the given colour on ANSI-capable terminals
      */
-    private static String colored(Ansi.Color color, String text) {
-        return Ansi.ansi().fgBright(color).a(text).reset().toString();
+    private static String colored(String text) {
+        return text;
     }
 
     /**
-     * Executes all {@link Kind#UPLOAD} actions in the plan, in order.
+     * Executes all {@link Kind#UPLOAD} actions in the plan, in order, firing
+     * {@link SyncProgressListener} events after each action.
      * Stops on quota exhaustion; logs errors for individual failures without aborting the run.
      *
      * @param plan the list of planned actions
      */
     private void executePlan(List<SyncAction> plan) {
-        long uploadCount = plan.stream().filter(a -> a.kind() == Kind.UPLOAD).count();
-        int  uploadIndex = 0;
-        int maxFilenameWidth = plan.stream()
-                .filter(a -> a.kind() == Kind.UPLOAD)
-                .mapToInt(a -> a.filename().length())
-                .max()
-                .orElse(0);
-        // Match the progress bar width to the plan-table width (fileCol + 30 border chars).
-        int fileCol    = Math.max(80, plan.stream().mapToInt(a -> a.filename().length()).max().orElse(40));
-        int tableWidth = fileCol + 30;
+        int completed = 0;
+        int total     = plan.size();
 
         for (SyncAction action : plan) {
-            if (action.kind() != Kind.UPLOAD) continue;
-            uploadIndex++;
+            if (action.kind() != Kind.UPLOAD) {
+                listener.onActionCompleted(++completed, total, action);
+                continue;
+            }
             try {
-                executeUpload(action, uploadIndex, (int) uploadCount, maxFilenameWidth, tableWidth);
+                executeUpload(action);
             } catch (QuotaBudgetExceededException e) {
-                System.out.println();
-                System.out.println(e.getMessage());
-                log.error("Quota budget exhausted: {}", e.getMessage());
+                log.error("Quota budget exhausted — stopping: {}", e.getMessage());
+                listener.onActionCompleted(++completed, total, action);
                 break;
             } catch (QuotaExceededException e) {
-                System.out.println();
-                System.out.println("YouTube API daily quota exceeded — remaining uploads cancelled.");
-                log.error("YouTube API daily quota exceeded");
+                log.error("YouTube API daily quota exceeded — remaining uploads cancelled.");
+                listener.onActionCompleted(++completed, total, action);
                 break;
             } catch (Exception e) {
                 log.error("Unexpected error uploading {}: {}", action.filename(), e.getMessage(), e);
             }
+            listener.onActionCompleted(++completed, total, action);
         }
     }
 
@@ -324,28 +323,16 @@ public class SyncService {
     /**
      * Uploads a single video, adds it to the playlist, and handles the old version.
      *
-     * <p>The {@code maxFilenameWidth} parameter is used to pad the filename in the progress-bar
-     * task name so that all bars across the session start at the same terminal column.
-     *
-     * @param action           the planned upload action
-     * @param index            1-based index of this upload within all uploads in the plan
-     * @param totalUploads     total number of UPLOAD actions in the plan
-     * @param maxFilenameWidth length of the longest filename in the plan, used for alignment
-     * @param tableWidth       total character width of the plan table, used to size the progress bar
+     * @param action the planned upload action
      * @throws IOException on API failure
      */
-    private void executeUpload(SyncAction action, int index, int totalUploads,
-                               int maxFilenameWidth, int tableWidth) throws IOException {
-        int indexWidth = String.valueOf(totalUploads).length();
-        String prefix = String.format("[%" + indexWidth + "d/%d] %-" + maxFilenameWidth + "s",
-                index, totalUploads, action.filename());
-
-        // Locate old video ID before uploading (so we can handle it afterwards)
+    private void executeUpload(SyncAction action) throws IOException {
+        // Locate old video ID before uploading (so we can handle it afterwards).
         String oldVideoId = action.remoteVersion() > 0
                 ? findVideoIdInPlaylist(action.playlistId(), action.baseTitle(), action.remoteVersion())
                 : null;
 
-        String newVideoId = uploadVideo(action, prefix, tableWidth);
+        String newVideoId = uploadVideo(action);
         addToPlaylist(newVideoId, action.playlistId());
 
         if (oldVideoId != null) {
@@ -616,7 +603,7 @@ public class SyncService {
      */
     public void printPlanTable(List<SyncAction> plan) {
         // Compute column widths
-        int fileCol = Math.max(80, plan.stream()
+        int fileCol = Math.max(MAX_TABLE_WIDTH, plan.stream()
                 .mapToInt(a -> a.filename().length()).max().orElse(40));
 
         // Unicode box-drawing characters render correctly when App.configureWindowsConsole()
@@ -640,10 +627,10 @@ public class SyncService {
             // Each label is exactly 6 visible characters so %s keeps the column aligned
             // even though the Jansi escape bytes make the String longer than 6.
             String action = switch (a.kind()) {
-                case UPLOAD -> colored(Ansi.Color.GREEN, "UPLOAD");
-                case QUOTA -> colored(Ansi.Color.YELLOW, "QUOTA ");
-                case SKIP -> colored(Ansi.Color.BLUE, " SKIP ");
-                case ERROR -> colored(Ansi.Color.RED, " ERR  ");
+                case UPLOAD -> colored("UPLOAD");
+                case QUOTA -> colored("QUOTA ");
+                case SKIP -> colored(" SKIP ");
+                case ERROR -> colored(" ERR  ");
             };
             String local  = a.localVersion() >= 0 ? String.valueOf(a.localVersion()) : "-";
             String remote = a.remoteVersion() >= 0 ? String.valueOf(a.remoteVersion()) : "-";
@@ -677,7 +664,7 @@ public class SyncService {
     }
 
     /**
-     * Prints a summary of the sync run to {@code System.out}.
+     * Logs a summary of the sync run.
      *
      * @param plan the list of planned actions
      */
@@ -686,14 +673,8 @@ public class SyncService {
         long quotas  = plan.stream().filter(a -> a.kind() == Kind.QUOTA).count();
         long skips   = plan.stream().filter(a -> a.kind() == Kind.SKIP).count();
         long errs    = plan.stream().filter(a -> a.kind() == Kind.ERROR).count();
-        System.out.println("─────────────────────────────────────────");
-        System.out.println("Sync summary");
-        System.out.printf("  Files scanned  : %d%n", plan.size());
-        System.out.printf("  Uploaded       : %s%n", dryRun ? "0 (dry-run)" : uploads);
-        System.out.printf("  Quota-deferred : %d%n", quotas);
-        System.out.printf("  Skipped        : %d%n", skips);
-        System.out.printf("  Errors         : %d%n", errs);
-        System.out.println("─────────────────────────────────────────");
+        log.info("Sync summary — scanned: {}, uploaded: {}, quota-deferred: {}, skipped: {}, errors: {}",
+                plan.size(), dryRun ? "0 (dry-run)" : uploads, quotas, skips, errs);
     }
 
     /**
@@ -744,12 +725,51 @@ public class SyncService {
     }
 
     /**
+     * Phase 1: validates playlists, builds the sync plan, and applies quota constraints.
+     *
+     * <p>No mutations are made.  This is the method called by the UI's "Load Plan" button;
+     * pass the returned list to {@link #executeSync} when the user confirms.
+     *
+     * @param folder the watched video folder
+     * @return ordered list of {@link SyncAction} — one per video file
+     * @throws IOException if the folder cannot be listed or if playlist validation fails
+     */
+    public List<SyncAction> planSync(Path folder) throws IOException {
+        List<Path> videoFiles = listVideoFiles(folder);
+        log.info("Found {} video file(s) in {}", videoFiles.size(), folder);
+
+        Set<String> referencedPlaylists = collectPlaylistIds(videoFiles, folder);
+        if (!validatePlaylists(referencedPlaylists)) {
+            throw new IOException(
+                    "One or more playlist IDs in the sidecar JSON files are invalid or inaccessible. "
+                    + "Check the sidecar JSON files and verify the playlist IDs on YouTube.");
+        }
+
+        List<SyncAction> plan = buildPlan(videoFiles, folder);
+        return applyQuotaConstraints(plan);
+    }
+
+    /**
+     * Phase 3: executes all {@link Kind#UPLOAD} actions in the given plan.
+     *
+     * <p>Progress is reported via the {@link SyncProgressListener} provided at construction time.
+     * Use this method — together with {@link #planSync} — from the UI so that the plan can be
+     * reviewed before execution begins.
+     *
+     * @param plan the list of planned actions returned by {@link #planSync}
+     */
+    public void executeSync(List<SyncAction> plan) {
+        executePlan(plan);
+        log.info(quotaTracker.summary());
+    }
+
+    /**
      * Runs the full synchronisation pass over the given folder.
      *
      * <p>Phase 1: build a {@link SyncAction} for every video file (no mutations).<br>
      * Phase 2 (dry-run only): print the plan table and quota projection to the console, then
      * exit without uploading anything.<br>
-     * Phase 3 (live only): execute uploads, printing a per-video progress bar to the console.
+     * Phase 3 (live only): execute uploads, reporting progress via the configured listener.
      *
      * @param folder the watched video folder
      * @throws IOException if the folder cannot be listed
@@ -787,24 +807,17 @@ public class SyncService {
     }
 
     /**
-     * Uploads a video file to YouTube, rendering a per-video {@link ProgressBar} prefixed with
-     * {@code [n/total] filename}.
+     * Uploads a video file to YouTube.
      *
-     * <p>The bar is byte-based (unit: MB) so the operator sees actual megabytes transferred.
-     * Completed bars remain visible on the terminal; subsequent uploads appear below, giving a
-     * stacked history of all uploads in the session.
-     * The rendered length of the bar is set to {@code tableWidth} by passing it directly to the
-     * {@link ConsoleProgressBarConsumer} constructor so the bar spans exactly as wide as the
-     * plan table printed above it.
+     * <p>Upload progress is reported via {@link SyncProgressListener#onUploadProgress} at
+     * each {@code IN_PROGRESS} callback from the gateway.
      *
-     * @param action     the planned upload action
-     * @param prefix     display prefix string shown as the bar task name ({@code "[n/total] filename"})
-     * @param tableWidth total character width of the plan table, passed as the bar's max rendered length
+     * @param action the planned upload action
      * @return the YouTube video ID assigned by the API
      * @throws IOException            on upload failure
      * @throws QuotaExceededException if the API reports quota exhaustion
      */
-    private String uploadVideo(SyncAction action, String prefix, int tableWidth) throws IOException {
+    private String uploadVideo(SyncAction action) throws IOException {
         quotaTracker.charge(QuotaTracker.COST_VIDEO_INSERT, "videos.insert");
         String title = buildTitle(action.baseTitle(), action.localVersion());
 
@@ -829,32 +842,22 @@ public class SyncService {
         long        fileSizeBytes = action.videoFile().toFile().length();
 
         log.info("Uploading '{}' ({}) as '{}' ...",
-                action.filename(),
-                humanReadableSize(fileSizeBytes),
-                title);
+                action.filename(), humanReadableSize(fileSizeBytes), title);
 
         String videoId;
-        try (ProgressBar pb = new ProgressBarBuilder()
-                .setTaskName(prefix)
-                .setInitialMax(fileSizeBytes)
-                .setUnit("MB", 1_048_576)
-                .continuousUpdate()
-                .setStyle(ProgressBarStyle.COLORFUL_UNICODE_BLOCK)
-                .setConsumer(new ConsoleProgressBarConsumer(System.out, tableWidth))
-                .build()) {
-            try {
-                videoId = gateway.insertVideo(snippet, status, mediaContent, (state, percent) -> {
-                    switch (state) {
-                        case INITIATING -> log.info("Upload initialising ...");
-                        case IN_PROGRESS -> pb.stepTo((long) percent * fileSizeBytes / 100);
-                        case COMPLETE -> pb.stepTo(fileSizeBytes);
-                    }
-                });
-            } catch (GoogleJsonResponseException e) {
-                checkQuota(e);
-                throw e;
-            }
-        } // pb.close() — bar renders its completed state here
+        try {
+            videoId = gateway.insertVideo(snippet, status, mediaContent, (state, percent) -> {
+                switch (state) {
+                    case INITIATING -> log.info("Upload initialising: {}", action.filename());
+                    case IN_PROGRESS -> listener.onUploadProgress(action, percent);
+                    case COMPLETE -> listener.onUploadProgress(action, 100);
+                }
+            });
+        } catch (GoogleJsonResponseException e) {
+            checkQuota(e);
+            throw e;
+        }
+
         log.info("Upload complete — videoId={}, title='{}'", videoId, title);
         return videoId;
     }

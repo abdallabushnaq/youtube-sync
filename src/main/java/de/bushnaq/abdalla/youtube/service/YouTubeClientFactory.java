@@ -28,6 +28,7 @@ import com.google.api.client.util.store.FileDataStoreFactory;
 import com.google.api.services.youtube.YouTube;
 import com.google.api.services.youtube.YouTubeScopes;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -50,6 +51,7 @@ import java.util.List;
  * <p>The Google Cloud OAuth client-secrets JSON file ({@code client_secret.json}) must be
  * placed in the same folder as the video files (the watched folder).
  */
+@Component
 @Slf4j
 public class YouTubeClientFactory {
 

@@ -69,7 +69,7 @@ class SyncServiceIntegrationTest {
         // Resolve the video folder: explicit system property, or fall back to video/ in the
         // project root (which is the working directory when running via Maven or IntelliJ).
         String folderProp = System.getProperty("youtube.sync.folder");
-        Path   folder     = (folderProp != null) ? Path.of(folderProp) : Path.of("video");
+        Path   folder     = (folderProp != null) ? Path.of(folderProp) : Path.of("E:\\Videos\\kassandra\\videos");
 
         Assumptions.assumeTrue(Files.isDirectory(folder),
                 "Video folder not found: '" + folder.toAbsolutePath()
