@@ -42,7 +42,7 @@ import java.util.Map;
  * {@code chromedriver} executable — no manual path configuration is required.
  *
  * <p>The {@link WebDriver} instance is kept alive for the lifetime of the Spring application
- * context and is closed cleanly on shutdown via {@link #onShutdown()}.
+ * context and is closed cleanly on shutdown via {@link #destroy()}.
  */
 @Component
 @Slf4j
@@ -65,11 +65,16 @@ public class BrowserLauncherService {
      */
     @Value("${server.port:8080}")
     private              int       port;
+    /** Background thread that corrects the window size if the user resizes it. */
+    private              Thread    resizeWatcher;
     /** Desired window size; set before {@link #getDriver()} is called. */
     private              Dimension windowSize = new Dimension(WINDOW_WIDTH, WINDOW_HEIGHT);
 
     @PreDestroy
     public void destroy() {
+        if (resizeWatcher != null) {
+            resizeWatcher.interrupt();
+        }
         if (driver != null) {
             driver.quit();//quit the driver and close all windows
             driver = null;
@@ -179,9 +184,45 @@ public class BrowserLauncherService {
             getDriver();
             driver.get(url);
             log.info("Chrome window opened at {}x{}", WINDOW_WIDTH, WINDOW_HEIGHT);
+            startResizeWatcher();
         } catch (Exception ex) {
             log.warn("Could not open Chrome via Selenium — is Chrome installed? ({})", ex.getMessage(), ex);
         }
+    }
+
+    /**
+     * Starts a daemon thread that polls the Chrome window size every 300 ms and resets it
+     * to {@value #WINDOW_WIDTH}×{@value #WINDOW_HEIGHT} if the user resizes the window.
+     *
+     * <p>{@code window.resizeTo()} is blocked by Chrome's security policy for non-script-
+     * opened windows, so the only reliable resize-prevention mechanism is to intercept via
+     * the Selenium driver on the server side.
+     */
+    private void startResizeWatcher() {
+        Dimension target = new Dimension(WINDOW_WIDTH, WINDOW_HEIGHT);
+        resizeWatcher = new Thread(() -> {
+            while (!Thread.currentThread().isInterrupted()) {
+                try {
+                    Thread.sleep(300);
+                    if (driver != null) {
+                        Dimension current = driver.manage().window().getSize();
+                        if (current.width != target.width || current.height != target.height) {
+                            driver.manage().window().setSize(target);
+                            log.debug("Window resized by user — reset to {}x{}", WINDOW_WIDTH, WINDOW_HEIGHT);
+                        }
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    // Driver may throw briefly during page transitions; ignore silently.
+                    log.trace("Resize watcher skipped one cycle: {}", e.getMessage());
+                }
+            }
+        });
+        resizeWatcher.setDaemon(true);
+        resizeWatcher.setName("chrome-resize-watcher");
+        resizeWatcher.start();
+        log.debug("Chrome resize watcher started");
     }
 
 

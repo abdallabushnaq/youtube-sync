@@ -16,6 +16,7 @@
 package de.bushnaq.abdalla.youtube.ui;
 
 import com.google.api.services.youtube.YouTube;
+import com.vaadin.flow.component.AttachEvent;
 import com.vaadin.flow.component.UI;
 import com.vaadin.flow.component.button.Button;
 import com.vaadin.flow.component.button.ButtonVariant;
@@ -38,8 +39,8 @@ import de.bushnaq.abdalla.youtube.dto.SyncAction;
 import de.bushnaq.abdalla.youtube.service.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.vaadin.addons.componentfactory.directoryupload.DirectoryUpload;
 
-import com.vaadin.flow.component.dialog.Dialog;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -76,59 +77,66 @@ public class MainView extends VerticalLayout {
      */
     // browseButton is constructed inline — no field needed
     @Autowired
-    private       YouTubeClientFactory       clientFactory;
+    private       YouTubeClientFactory   clientFactory;
+    @Autowired
+    private       FolderPickerController folderPickerController;
     /**
      * The plan built by the last "Load Plan" invocation.
      */
-    private       List<SyncAction>           currentPlan;
+    private       List<SyncAction>     currentPlan;
     /**
      * The {@link SyncService} instance tied to the current plan (carries the quota tracker).
      */
-    private       SyncService                currentService;
+    private       SyncService          currentService;
+    /**
+     * Drop-zone that lets the user drag a folder onto the app to select it.
+     * Files are never actually uploaded — the component is used purely for folder selection.
+     */
+    private final DirectoryUpload directoryUpload;
     /**
      * When checked, the plan is shown but no uploads are performed.
      */
-    private final Checkbox                   dryRunCheckbox;
+    private final Checkbox             dryRunCheckbox;
     /**
      * Text field displaying the currently selected video folder path.
      */
-    private final TextField                  folderField;
+    private final TextField            folderField;
     /**
      * Builds the sync plan by querying YouTube.
      */
-    private final Button                     loadPlanButton;
+    private final Button               loadPlanButton;
     /**
      * Overall progress bar — advances once per completed action.
      */
-    private final ProgressBar                overallProgressBar;
+    private final ProgressBar          overallProgressBar;
     /**
      * Label next to the progress bar showing "completed / total".
      */
-    private final Span                       progressLabel;
+    private final Span                 progressLabel;
     /**
      * Estimated daily API quota budget (units).
      */
-    private final IntegerField               quotaBudgetField;
-    /**
-     * Selects what to do with the old video version after re-uploading.
-     */
-    private final Select<OldVersionStrategy> strategySelect;
+    private final IntegerField         quotaBudgetField;
 
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
     /**
+     * Selects what to do with the old video version after re-uploading.
+     */
+    private final Select<OldVersionStrategy> strategySelect;
+    /**
      * Summary counts shown below the grid.
      */
-    private final Span             summarySpan;
+    private final Span                       summarySpan;
     /**
      * Executes the current plan.
      */
-    private final Button           syncButton;
+    private final Button                     syncButton;
     /**
      * Displays one row per video file with its planned/actual action.
      */
-    private final Grid<SyncAction> syncGrid;
+    private final Grid<SyncAction>           syncGrid;
 
     // -------------------------------------------------------------------------
     // Spring dependencies
@@ -149,21 +157,55 @@ public class MainView extends VerticalLayout {
         log.info("hello");
         setPadding(true);
         setSpacing(true);
-        setWidthFull();
+        setSizeFull();
 
         // --- Heading ---
         add(new H2("YouTube Sync"));
 
         // --- Folder row ---
         folderField = new TextField("Video folder");
-        folderField.setPlaceholder("C:\\Users\\you\\Videos  (or drag a folder here)");
+        folderField.setPlaceholder("C:\\Users\\you\\Videos  — use Browse… or drop folder below");
         folderField.setWidth("520px");
 
-        Button browseButton = new Button("Browse…", _ -> openFolderChooser());
+        Button browseButton = new Button("Browse…", _ -> openNativeFolderPicker(null));
 
         HorizontalLayout folderRow = new HorizontalLayout(folderField, browseButton);
         folderRow.setAlignItems(Alignment.BASELINE);
         add(folderRow);
+
+        // --- Directory drop zone ---
+        // No receiver needed — autoUpload is false so files are never transferred.
+        directoryUpload = new DirectoryUpload();
+        directoryUpload.setAutoUpload(false);
+        directoryUpload.setStartButtonVisible(false);
+        directoryUpload.setRetryButtonVisible(false);
+        directoryUpload.setDropLabel(new Span("Drop folder here to select it"));
+        directoryUpload.setWidthFull();
+        directoryUpload.addFilesSelectedListener(event -> {
+            var files = event.getFiles();
+            if (!files.isEmpty()) {
+                // webkitRelativePath is "folderName/file.ext" — extract the top-level dir name.
+                String firstPath = files.getFirst().getName();
+                String folderName = firstPath.contains("/")
+                        ? firstPath.substring(0, firstPath.indexOf('/'))
+                        : firstPath;
+                log.debug("Directory drop detected folder name: '{}'", folderName);
+                UI ui = UI.getCurrent();
+                // Run the filesystem search on a virtual thread so the UI is not blocked.
+                Thread.ofVirtual().start(() -> {
+                    String found = folderPickerController.findFolder(folderName);
+                    ui.access(() -> {
+                        if (!found.isBlank()) {
+                            folderField.setValue(found);
+                        } else {
+                            showError("Could not locate folder '" + folderName
+                                    + "' automatically — please type the full path or use Browse…");
+                        }
+                    });
+                });
+            }
+        });
+        add(directoryUpload);
 
         // --- Settings row ---
         strategySelect = new Select<>();
@@ -209,9 +251,10 @@ public class MainView extends VerticalLayout {
         syncGrid.addColumn(a -> a.errorMessage() != null ? a.errorMessage() : "")
                 .setHeader("Note")
                 .setFlexGrow(2);
-        syncGrid.setHeight("420px");
+        syncGrid.setHeight(null);
         syncGrid.setWidthFull();
         add(syncGrid);
+        setFlexGrow(1, syncGrid);
 
         // --- Sync row ---
         syncButton = new Button("Sync", _ -> runSync());
@@ -234,15 +277,10 @@ public class MainView extends VerticalLayout {
         add(summarySpan);
 
         // --- Drag-and-drop: try to intercept OS folder path from drag events ---
-        installDragDropHandler();
-
+        // --- Lock window size and unload handler: all JS is installed in onAttach() ---
         // --- Shut down the JVM when the browser tab is closed ---
         installUnloadHandler();
     }
-
-    // -------------------------------------------------------------------------
-    // Folder selection
-    // -------------------------------------------------------------------------
 
     /**
      * Builds the coloured action badge component for a grid row.
@@ -292,6 +330,10 @@ public class MainView extends VerticalLayout {
         return span;
     }
 
+    // -------------------------------------------------------------------------
+    // Folder selection
+    // -------------------------------------------------------------------------
+
     /**
      * Builds a {@link SyncProgressListener} that updates the grid and progress bar via
      * {@code UI.access()} for each upload-progress tick and each completed action.
@@ -327,61 +369,6 @@ public class MainView extends VerticalLayout {
         };
     }
 
-    // -------------------------------------------------------------------------
-    // Plan phase
-    // -------------------------------------------------------------------------
-
-    /**
-     * Installs a page-level JavaScript drag-and-drop handler that attempts to extract a folder
-     * path from OS drag events and writes it into {@link #folderField}.
-     *
-     * <p>Modern browsers block access to absolute file paths for security reasons, but on some
-     * OS/browser combinations the {@code text/plain} or {@code text/uri-list} transfer data
-     * contains the path when a folder is dragged from the system file manager.  This handler
-     * tries both formats and falls back gracefully when neither yields a usable path.
-     *
-     * <p>The handler is attached to the {@code document} (not just the text field) so that the
-     * user can drop the folder anywhere on the page.
-     */
-    private void installDragDropHandler() {
-        getElement().executeJs("""
-                document.addEventListener('dragover', e => {
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = 'copy';
-                });
-                document.addEventListener('drop', e => {
-                    e.preventDefault();
-                    // Try text/uri-list first (file:///C:/path format — works on some Linux desktops).
-                    const uriList = e.dataTransfer.getData('text/uri-list');
-                    if (uriList) {
-                        const lines = uriList.split('\\n')
-                            .map(l => l.trim())
-                            .filter(l => l && !l.startsWith('#'));
-                        if (lines.length > 0) {
-                            let path = lines[0];
-                            if (path.startsWith('file:///')) {
-                                // Strip "file:///" and decode, convert forward-slashes to backslashes on Windows.
-                                path = decodeURIComponent(path.substring(8)).replace(/\\//g, '\\\\');
-                            } else if (path.startsWith('file://')) {
-                                path = decodeURIComponent(path.substring(7));
-                            }
-                            $0.value = path;
-                            $0.dispatchEvent(new Event('input', {bubbles: true}));
-                            $0.dispatchEvent(new Event('change', {bubbles: true}));
-                            return;
-                        }
-                    }
-                    // Fallback: text/plain (may contain path on some Windows + browser combos).
-                    const text = e.dataTransfer.getData('text/plain');
-                    if (text && text.trim().length > 0) {
-                        $0.value = text.trim();
-                        $0.dispatchEvent(new Event('input', {bubbles: true}));
-                        $0.dispatchEvent(new Event('change', {bubbles: true}));
-                    }
-                });
-                """, folderField.getElement());
-    }
-
     /**
      * Installs a page-level {@code beforeunload} JavaScript handler that calls
      * {@code GET /api/shutdown} when the browser tab is closed (or navigated away from).
@@ -402,7 +389,7 @@ public class MainView extends VerticalLayout {
     }
 
     // -------------------------------------------------------------------------
-    // Execute phase
+    // Plan phase
     // -------------------------------------------------------------------------
 
     /**
@@ -423,7 +410,12 @@ public class MainView extends VerticalLayout {
         }
 
         setButtonsEnabled(false, false);
-        summarySpan.setText("Loading plan…");
+        loadPlanButton.setText("Loading…");
+        overallProgressBar.getElement().setProperty("indeterminate", true);
+        overallProgressBar.setVisible(true);
+        progressLabel.setText("Building plan…");
+        progressLabel.setVisible(true);
+        summarySpan.setText("");
         uploadProgressMap.clear();
 
         UI ui = UI.getCurrent();
@@ -446,12 +438,20 @@ public class MainView extends VerticalLayout {
                     uploadProgressMap.clear();
                     syncGrid.setItems(plan);
                     updateSummary(plan);
+                    loadPlanButton.setText("Load Plan");
+                    overallProgressBar.getElement().setProperty("indeterminate", false);
+                    overallProgressBar.setVisible(false);
+                    progressLabel.setVisible(false);
                     boolean hasUploads = plan.stream().anyMatch(a -> a.kind() == SyncAction.Kind.UPLOAD);
                     setButtonsEnabled(true, hasUploads && !dryRunCheckbox.getValue());
                 });
             } catch (Exception ex) {
                 log.error("Failed to load plan: {}", ex.getMessage(), ex);
                 ui.access(() -> {
+                    loadPlanButton.setText("Load Plan");
+                    overallProgressBar.getElement().setProperty("indeterminate", false);
+                    overallProgressBar.setVisible(false);
+                    progressLabel.setVisible(false);
                     setButtonsEnabled(true, false);
                     summarySpan.setText("Plan failed.");
                     showError("Could not build plan: " + ex.getMessage());
@@ -461,64 +461,54 @@ public class MainView extends VerticalLayout {
     }
 
     // -------------------------------------------------------------------------
+    // Execute phase
+    // -------------------------------------------------------------------------
+
+    /**
+     * Moves JavaScript installation to after the component is attached to the client DOM.
+     * Calling {@code executeJs} in the constructor is too early — the client-side element
+     * does not yet exist, so the scripts are queued but may not bind correctly.
+     *
+     * @param attachEvent the attach event
+     */
+    @Override
+    protected void onAttach(AttachEvent attachEvent) {
+        super.onAttach(attachEvent);
+        installUnloadHandler();
+    }
+
+    // -------------------------------------------------------------------------
     // Grid helpers
     // -------------------------------------------------------------------------
 
     /**
-     * Opens a small Vaadin {@link Dialog} that lets the user type or paste a folder path.
-     * This replaces the old {@code JFileChooser} approach, which fails in a headless
-     * Spring Boot server environment ({@code java.awt.headless=true}).
+     * Opens the native OS folder-picker dialog via a server-side REST call and writes the
+     * selected path into {@link #folderField}.
      *
-     * <p>The dialog is pre-filled with whatever is already in {@link #folderField}.
-     * Pressing <strong>OK</strong> or hitting Enter validates that the path is a directory
-     * and writes it back to {@link #folderField}.  Invalid paths show an inline error
-     * message inside the dialog.
+     * <p>Because Spring Boot runs with {@code java.awt.headless=true} the standard AWT
+     * {@code JFileChooser} is unavailable.  Instead, a {@code fetch} call is made to
+     * {@code /api/folder-picker} which spawns an OS-native dialog (PowerShell on Windows,
+     * {@code osascript} on macOS, {@code zenity} on Linux).
+     *
+     * @param initialDir optional starting directory passed as a hint to the dialog;
+     *                   pass {@code null} to use the current field value
      */
-    private void openFolderChooser() {
-        Dialog dialog = new Dialog();
-        dialog.setHeaderTitle("Select video folder");
-        dialog.setWidth("480px");
-
-        TextField pathField = new TextField("Folder path");
-        pathField.setWidthFull();
-        pathField.setPlaceholder("C:\\Users\\you\\Videos");
-        String current = folderField.getValue().trim();
-        if (!current.isBlank()) {
-            pathField.setValue(current);
-        }
-
-        Span errorSpan = new Span();
-        errorSpan.getStyle().set("color", "var(--lumo-error-color)").set("font-size", "0.875em");
-
-        VerticalLayout content = new VerticalLayout(pathField, errorSpan);
-        content.setPadding(false);
-        content.setSpacing(false);
-        dialog.add(content);
-
-        Button okButton = new Button("OK", _ -> {
-            String entered = pathField.getValue().trim();
-            if (entered.isBlank()) {
-                errorSpan.setText("Path must not be empty.");
-                return;
-            }
-            Path p = Path.of(entered);
-            if (!Files.isDirectory(p)) {
-                errorSpan.setText("Not a valid directory: " + entered);
-                return;
-            }
-            folderField.setValue(entered);
-            dialog.close();
-        });
-        okButton.addThemeVariants(ButtonVariant.LUMO_PRIMARY);
-
-        Button cancelButton = new Button("Cancel", _ -> dialog.close());
-
-        dialog.getFooter().add(cancelButton, okButton);
-
-        // Allow confirming with Enter key inside the text field.
-        pathField.addKeyPressListener(com.vaadin.flow.component.Key.ENTER, _ -> okButton.click());
-
-        dialog.open();
+    private void openNativeFolderPicker(String initialDir) {
+        String hint = initialDir != null ? initialDir : folderField.getValue().trim();
+        // Use JS fetch so the result flows straight back into the field without a round-trip
+        // through the Vaadin server-push channel.
+        getElement().executeJs("""
+                const hint = encodeURIComponent($0);
+                fetch('/api/folder-picker?initialDir=' + hint)
+                    .then(r => r.text())
+                    .then(path => {
+                        if (path && path.trim().length > 0) {
+                            $1.value = path.trim();
+                            $1.dispatchEvent(new Event('input', {bubbles: true}));
+                            $1.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    });
+                """, hint, folderField.getElement());
     }
 
     // -------------------------------------------------------------------------
