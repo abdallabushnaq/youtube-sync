@@ -15,35 +15,41 @@
  */
 package de.bushnaq.abdalla.youtube;
 
-import com.vaadin.flow.component.dependency.StyleSheet;
-import com.vaadin.flow.component.page.AppShellConfigurator;
-import com.vaadin.flow.theme.lumo.Lumo;
+import com.formdev.flatlaf.FlatDarkLaf;
+import de.bushnaq.abdalla.youtube.ui.MainFrame;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.context.annotation.ComponentScan;
+import org.springframework.context.ConfigurableApplicationContext;
+
+import javax.swing.SwingUtilities;
 
 /**
- * Spring Boot entry point for the youtube-sync Vaadin application.
+ * Spring Boot entry point for the youtube-sync Swing application.
  *
- * <p>Start the application with {@code java -jar youtube-sync.jar}; the embedded Tomcat
- * server starts on port 8080 and the default browser opens automatically.
- *
- * <p>The two {@code @StyleSheet} annotations load the Lumo design-system CSS directly.
- * This is the Vaadin 25 recommended approach — the deprecated {@code @Theme} annotation
- * on {@code AppShellConfigurator} is no longer needed.
+ * <p>Starts a non-web Spring application context (DI only — no embedded server),
+ * installs the FlatLaf dark look-and-feel, then opens {@link MainFrame} on the
+ * Swing Event Dispatch Thread.
  */
 @SpringBootApplication
-@ComponentScan
-@StyleSheet("context://" + Lumo.STYLESHEET)
-@StyleSheet("context://" + Lumo.UTILITY_STYLESHEET)
-public class App implements AppShellConfigurator {
+public class App {
 
     /**
      * Application entry point.
      *
      * @param args command-line arguments passed to Spring Boot
      */
-    static void main(String[] args) {
-        SpringApplication.run(App.class, args);
+    public static void main(String[] args) {
+        // FlatLaf must be installed before any Swing component is created.
+        FlatDarkLaf.setup();
+
+        SpringApplication application = new SpringApplication(App.class);
+        // AWT/Swing requires headless=false.
+        application.setHeadless(false);
+        ConfigurableApplicationContext ctx = application.run(args);
+
+        SwingUtilities.invokeLater(() -> {
+            MainFrame frame = ctx.getBean(MainFrame.class);
+            frame.setVisible(true);
+        });
     }
 }

@@ -28,19 +28,17 @@
     <packaging>jar</packaging>
 
     <name>youtube-sync</name>
-    <description>Synchronise a local video folder with a YouTube channel — Vaadin UI.</description>
+    <description>Synchronise a local video folder with a YouTube channel — Swing/FlatLaf UI.</description>
 
     <properties>
         <java.version>25</java.version>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-        <vaadin.version>25.1.5</vaadin.version>
+        <flatlaf.version>3.5.4</flatlaf.version>
         <google.api.version>v3-rev20240514-2.0.0</google.api.version>
         <google.oauth.jetty.version>1.36.0</google.oauth.jetty.version>
         <google.http.client.version>1.44.2</google.http.client.version>
         <lombok.version>1.18.42</lombok.version>
-        <directory-upload.version>3.0.0</directory-upload.version>
-        <!--        <selenium.version>4.39.0</selenium.version>-->
     </properties>
 
     <dependencyManagement>
@@ -53,30 +51,21 @@
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
-            <dependency>
-                <groupId>com.vaadin</groupId>
-                <artifactId>vaadin-bom</artifactId>
-                <version>${vaadin.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
         </dependencies>
     </dependencyManagement>
 
     <dependencies>
-        <!-- Vaadin -->
+        <!-- Spring Boot (no embedded web server) -->
         <dependency>
-            <groupId>com.vaadin</groupId>
-            <artifactId>vaadin-core</artifactId>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
         </dependency>
+
+        <!-- FlatLaf — modern Swing look-and-feel -->
         <dependency>
-            <groupId>com.vaadin</groupId>
-            <artifactId>vaadin-spring-boot-starter</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.vaadin</groupId>
-            <artifactId>vaadin-dev</artifactId>
-            <optional>true</optional>
+            <groupId>com.formdev</groupId>
+            <artifactId>flatlaf</artifactId>
+            <version>${flatlaf.version}</version>
         </dependency>
 
         <!-- YouTube Data API v3 -->
@@ -121,43 +110,6 @@
             <scope>provided</scope>
         </dependency>
 
-        <!-- Directory-upload Vaadin addon — native folder-drop component -->
-        <dependency>
-            <groupId>org.vaadin.addons.componentfactory</groupId>
-            <artifactId>directory-upload</artifactId>
-            <version>${directory-upload.version}</version>
-        </dependency>
-
-        <dependency>
-            <groupId>org.seleniumhq.selenium</groupId>
-            <artifactId>selenium-java</artifactId>
-            <version>4.33.0</version>
-        </dependency>
-        <dependency>
-            <groupId>io.github.bonigarcia</groupId>
-            <artifactId>webdrivermanager</artifactId>
-            <version>6.3.3</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>com.google.guava</groupId>
-                    <artifactId>guava</artifactId>
-                </exclusion>
-                <!-- Add this exclusion to fix SLF4J multiple binding issue -->
-                <exclusion>
-                    <groupId>org.slf4j</groupId>
-                    <artifactId>slf4j-jdk14</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>com.github.docker-java</groupId>
-                    <artifactId>docker-java</artifactId>
-                </exclusion>
-                <exclusion>
-                    <groupId>com.github.docker-java</groupId>
-                    <artifactId>docker-java-transport-httpclient5</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-
         <!-- Tests -->
         <dependency>
             <groupId>org.junit.jupiter</groupId>
@@ -189,19 +141,6 @@
                 </configuration>
             </plugin>
 
-            <plugin>
-                <groupId>com.vaadin</groupId>
-                <artifactId>vaadin-maven-plugin</artifactId>
-                <version>${vaadin.version}</version>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>prepare-frontend</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-
             <!-- Spring Boot fat-JAR -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
@@ -218,18 +157,10 @@
         </plugins>
     </build>
 
-    <!-- production profile kept for compatibility; build-frontend now runs in the default build -->
     <profiles>
         <profile>
             <id>production</id>
         </profile>
     </profiles>
-
-    <repositories>
-        <repository>
-            <id>vaadin-addons</id>
-            <url>https://maven.vaadin.com/vaadin-addons</url>
-        </repository>
-    </repositories>
 
 </project>
