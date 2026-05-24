@@ -65,7 +65,8 @@ public class BrowserLauncherService {
      */
     @Value("${server.port:8080}")
     private              int       port;
-    private              Dimension windowSize;                     // Added field to store custom window size
+    /** Desired window size; set before {@link #getDriver()} is called. */
+    private              Dimension windowSize = new Dimension(WINDOW_WIDTH, WINDOW_HEIGHT);
 
     @PreDestroy
     public void destroy() {
@@ -175,30 +176,13 @@ public class BrowserLauncherService {
         String url = "http://localhost:" + port;
         log.info("Opening browser at {}", url);
         try {
-            driver = getDriver();
-//            ChromeOptions options = new ChromeOptions();
-//            options.addArguments("--app=" + url);
-//            options.addArguments("--window-size=" + WINDOW_WIDTH + "," + WINDOW_HEIGHT);
-//            driver = new ChromeDriver(options);
-//            log.info("Chrome app window opened at {}x{}", WINDOW_WIDTH, WINDOW_HEIGHT);
+            getDriver();
+            driver.get(url);
+            log.info("Chrome window opened at {}x{}", WINDOW_WIDTH, WINDOW_HEIGHT);
         } catch (Exception ex) {
             log.warn("Could not open Chrome via Selenium — is Chrome installed? ({})", ex.getMessage(), ex);
         }
     }
 
-    /**
-     * Closes the Chrome window when the Spring application context shuts down.
-     */
-    @PreDestroy
-    public void onShutdown() {
-        if (driver != null) {
-            try {
-                driver.quit();
-                log.info("Chrome window closed.");
-            } catch (Exception ex) {
-                log.debug("Error while closing Chrome: {}", ex.getMessage());
-            }
-        }
-    }
 
 }
